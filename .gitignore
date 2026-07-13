@@ -1,0 +1,4 @@
+/target/
+/artifacts/
+/.python-envs/
+.DS_Store
