@@ -1,8 +1,9 @@
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use babycat::{Signal, Waveform, WaveformArgs};
+use hound::{SampleFormat, WavSpec, WavWriter};
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Conv1d, Upsample, UpsampleMode};
 use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
@@ -18,49 +19,55 @@ pub struct Audio {
     pub sample_rate: u32,
 }
 
-pub fn load_wav_first_channel(path: impl AsRef<Path>) -> Result<Audio> {
+pub fn load_audio_first_channel(path: impl AsRef<Path>) -> Result<Audio> {
     let path = path.as_ref();
-    let reader = WavReader::open(path)
-        .with_context(|| format!("failed to open input WAV {}", path.display()))?;
-    decode_wav_first_channel(reader, &path.display().to_string())
+    let filename = path
+        .to_str()
+        .with_context(|| format!("input audio path is not valid UTF-8: {}", path.display()))?;
+    let waveform = Waveform::from_file(
+        filename,
+        WaveformArgs {
+            num_channels: 1,
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("failed to decode input audio {}", path.display()))?;
+    waveform_to_audio(waveform, &path.display().to_string())
 }
 
-pub fn load_wav_bytes_first_channel(bytes: &[u8]) -> Result<Audio> {
-    let reader = WavReader::new(Cursor::new(bytes)).context("failed to decode uploaded WAV")?;
-    decode_wav_first_channel(reader, "uploaded WAV")
+pub fn load_audio_bytes_first_channel(
+    bytes: &[u8],
+    file_extension: &str,
+    mime_type: &str,
+) -> Result<Audio> {
+    let waveform = Waveform::from_encoded_bytes_with_hint(
+        bytes,
+        WaveformArgs {
+            num_channels: 1,
+            ..Default::default()
+        },
+        file_extension,
+        mime_type,
+    )
+    .context("failed to decode uploaded audio")?;
+    waveform_to_audio(waveform, "uploaded audio")
 }
 
-fn decode_wav_first_channel<R: Read>(mut reader: WavReader<R>, label: &str) -> Result<Audio> {
-    let spec = reader.spec();
-    ensure!(spec.channels > 0, "{label} has no audio channels");
-    let samples = match spec.sample_format {
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-        SampleFormat::Int => {
-            ensure!(
-                (1..=32).contains(&spec.bits_per_sample),
-                "unsupported PCM bit depth {}",
-                spec.bits_per_sample
-            );
-            let scale = (1_u64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|sample| sample.map(|value| value as f32 / scale))
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        }
-    };
-    let channels = spec.channels as usize;
+fn waveform_to_audio(waveform: Waveform, label: &str) -> Result<Audio> {
+    let sample_rate = waveform.frame_rate_hz();
     ensure!(
-        samples.len() % channels == 0,
-        "{label} has an incomplete audio frame"
+        matches!(sample_rate, 44_100 | 48_000),
+        "{label} has unsupported sample rate {sample_rate} Hz; expected 44100 or 48000 Hz"
     );
-    let frames = samples.len() / channels;
+    ensure!(
+        waveform.num_channels() == 1,
+        "{label} was not decoded as mono"
+    );
+    let frames = i32::try_from(waveform.num_frames()).context("input audio is too long")?;
     ensure!(frames > 0, "{label} contains no audio samples");
-    let interleaved = Array::from_slice(&samples, &[frames as i32, channels as i32]);
     Ok(Audio {
-        samples: interleaved.index((.., 0)).reshape(&[1, -1])?,
-        sample_rate: spec.sample_rate,
+        samples: Array::from_slice(waveform.to_interleaved_samples(), &[1, frames]),
+        sample_rate,
     })
 }
 

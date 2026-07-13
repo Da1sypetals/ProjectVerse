@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use sovits_svc_mlx::audio::{load_wav_first_channel, write_wav_float};
+use sovits_svc_mlx::audio::{load_audio_first_channel, write_wav_float};
 use sovits_svc_mlx::inference::{InferenceOptions, SliceInferenceOptions, SovitsSvc};
 
 #[derive(Debug, Parser)]
@@ -12,11 +12,8 @@ use sovits_svc_mlx::inference::{InferenceOptions, SliceInferenceOptions, SovitsS
     about = "Run so-vits-svc GAN and shallow-diffusion inference with MLX"
 )]
 struct Arguments {
-    /// Input WAV file.
+    /// Input audio file supported by Babycat, sampled at 44.1 or 48 kHz.
     input: PathBuf,
-
-    /// Output WAV file.
-    output: PathBuf,
 
     /// Directory containing the converted GAN, diffusion, ContentVec, and vocoder weights.
     #[arg(long, default_value = "artifacts")]
@@ -27,7 +24,7 @@ struct Arguments {
     fcpe_checkpoint: PathBuf,
 
     /// Pitch shift in semitones.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     pitch_shift: f32,
 
     /// GAN latent noise scale.
@@ -54,12 +51,16 @@ struct Arguments {
     #[arg(long)]
     second_encoding: bool,
 
-    /// Enable silence slicing and chunked inference.
-    #[arg(long)]
-    sliced: bool,
+    /// Disable the silence slicing used by the original Python inference entry point.
+    #[arg(
+        long = "no-slicing",
+        action = clap::ArgAction::SetFalse,
+        default_value_t = true
+    )]
+    slicing: bool,
 
     /// Silence threshold in dB.
-    #[arg(long, default_value_t = -40.0)]
+    #[arg(long, default_value_t = -40.0, allow_hyphen_values = true)]
     threshold_db: f32,
 
     /// Context padding around each non-silent slice in seconds.
@@ -79,9 +80,19 @@ struct Arguments {
     crossfade_ratio: f32,
 }
 
+fn output_path(input: &Path) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .context("input audio filename has no stem")?;
+    let mut filename = stem.to_os_string();
+    filename.push("-converted.wav");
+    Ok(input.with_file_name(filename))
+}
+
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let input = load_wav_first_channel(&arguments.input)?;
+    let output_path = output_path(&arguments.input)?;
+    let input = load_audio_first_channel(&arguments.input)?;
     let mut model = SovitsSvc::load(
         arguments.artifact_dir.join("gan.safetensors"),
         arguments.artifact_dir.join("diffusion.safetensors"),
@@ -107,7 +118,7 @@ fn main() -> Result<()> {
     };
 
     let started = Instant::now();
-    let (output, frame_count) = if arguments.sliced {
+    let (output, frame_count) = if arguments.slicing {
         (
             model.infer_sliced(
                 &input.samples,
@@ -118,28 +129,45 @@ fn main() -> Result<()> {
             None,
         )
     } else {
-        let inferred = model.infer(
-            &input.samples,
-            input.sample_rate as i32,
-            &inference_options,
-        )?;
+        let inferred = model.infer(&input.samples, input.sample_rate as i32, &inference_options)?;
         let frame_count = inferred.f0.shape()[1];
         (inferred.audio, Some(frame_count))
     };
     let sample_count = output.shape()[1];
-    write_wav_float(&arguments.output, &output, 44_100)?;
+    write_wav_float(&output_path, &output, 44_100)?;
     if let Some(frame_count) = frame_count {
         println!(
             "inference completed in {:.3}s: frames={frame_count}, samples={sample_count}, output={}",
             started.elapsed().as_secs_f64(),
-            arguments.output.display()
+            output_path.display()
         );
     } else {
         println!(
             "sliced inference completed in {:.3}s: samples={sample_count}, output={}",
             started.elapsed().as_secs_f64(),
-            arguments.output.display()
+            output_path.display()
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_enable_slicing_and_derive_output_path() {
+        let arguments = Arguments::try_parse_from(["infer", "voice.demo.flac"]).unwrap();
+        assert!(arguments.slicing);
+        assert_eq!(
+            output_path(&arguments.input).unwrap(),
+            PathBuf::from("voice.demo-converted.wav")
+        );
+    }
+
+    #[test]
+    fn no_slicing_flag_disables_slicing() {
+        let arguments = Arguments::try_parse_from(["infer", "voice.wav", "--no-slicing"]).unwrap();
+        assert!(!arguments.slicing);
+    }
 }
