@@ -8,7 +8,7 @@ Rust and MLX inference for the supplied so-vits-svc 4.1 GAN and shallow-diffusio
 cargo run --release --example infer -- --help
 ```
 
-The CLI exposes every single-segment and sliced-inference parameter. It accepts 44.1 or 48 kHz audio in every format supported by Babycat and writes `<input-stem>-converted.wav` beside the input file. Silence slicing is enabled by default to match the original Python inference entry point; pass `--no-slicing` to disable it.
+The CLI exposes every single-segment and sliced-inference parameter. It accepts 44.1 or 48 kHz audio in every format supported by Babycat and writes `<input-stem>-converted.wav` beside the input file. Silence slicing is enabled by default to match the original Python inference entry point; pass `--no-slicing` to disable it. Shallow diffusion defaults off like the Python CLI and can be enabled with `--shallow-diffusion`.
 
 ## Web
 

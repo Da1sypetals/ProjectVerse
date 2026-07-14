@@ -35,6 +35,10 @@ struct Arguments {
     #[arg(long)]
     predict_f0: bool,
 
+    /// Refine the GAN output with shallow diffusion.
+    #[arg(long)]
+    shallow_diffusion: bool,
+
     /// Number of shallow-diffusion steps from the training schedule.
     #[arg(long, default_value_t = 100)]
     diffusion_steps: i32,
@@ -104,6 +108,7 @@ fn main() -> Result<()> {
         pitch_shift: arguments.pitch_shift,
         noise_scale: arguments.noise_scale,
         predict_f0: arguments.predict_f0,
+        shallow_diffusion: arguments.shallow_diffusion,
         diffusion_steps: arguments.diffusion_steps,
         diffusion_speedup: arguments.diffusion_speedup,
         loudness_envelope_adjustment: arguments.loudness_envelope_adjustment,
@@ -159,6 +164,7 @@ mod tests {
     fn defaults_enable_slicing_and_derive_output_path() {
         let arguments = Arguments::try_parse_from(["infer", "voice.demo.flac"]).unwrap();
         assert!(arguments.slicing);
+        assert!(!arguments.shallow_diffusion);
         assert_eq!(
             output_path(&arguments.input).unwrap(),
             PathBuf::from("voice.demo-converted.wav")
@@ -169,5 +175,12 @@ mod tests {
     fn no_slicing_flag_disables_slicing() {
         let arguments = Arguments::try_parse_from(["infer", "voice.wav", "--no-slicing"]).unwrap();
         assert!(!arguments.slicing);
+    }
+
+    #[test]
+    fn shallow_diffusion_flag_enables_diffusion() {
+        let arguments =
+            Arguments::try_parse_from(["infer", "voice.wav", "--shallow-diffusion"]).unwrap();
+        assert!(arguments.shallow_diffusion);
     }
 }

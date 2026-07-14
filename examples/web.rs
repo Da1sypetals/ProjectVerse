@@ -305,6 +305,9 @@ async fn infer(
             "predict_f0" => {
                 parameters.inference.predict_f0 = parse_field(&name, &value)?;
             }
+            "shallow_diffusion" => {
+                parameters.inference.shallow_diffusion = parse_field(&name, &value)?;
+            }
             "diffusion_steps" => {
                 parameters.inference.diffusion_steps = parse_field(&name, &value)?;
             }
@@ -446,11 +449,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_defaults_match_original_web_ui() {
+    fn web_defaults_match_reference_interfaces() {
         let parameters = WebParameters::default();
         assert_eq!(parameters.inference.pitch_shift, 0.0);
         assert_eq!(parameters.inference.noise_scale, 0.4);
         assert!(!parameters.inference.predict_f0);
+        assert!(!parameters.inference.shallow_diffusion);
         assert_eq!(parameters.inference.diffusion_steps, 100);
         assert_eq!(parameters.inference.diffusion_speedup, 10);
         assert_eq!(parameters.inference.loudness_envelope_adjustment, 0.0);
@@ -936,6 +940,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
       box-shadow: var(--focus-ring);
     }
 
+    .switch input:disabled {
+      cursor: not-allowed;
+    }
+
+    .switch input:disabled + .switch-track {
+      opacity: 0.52;
+    }
+
     .slice-fields[aria-disabled="true"] {
       opacity: 0.52;
     }
@@ -1188,11 +1200,21 @@ const INDEX_HTML: &str = r##"<!doctype html>
                 </div>
                 <div class="switch-row">
                   <span class="switch-copy">
+                    <span class="switch-title">Shallow Diffusion</span>
+                    <span class="switch-description">Refine the GAN waveform with diffusion and the diffusion vocoder.</span>
+                  </span>
+                  <label class="switch">
+                    <input id="shallow_diffusion" type="checkbox" aria-label="Enable shallow diffusion">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="switch-row">
+                  <span class="switch-copy">
                     <span class="switch-title">Second Encoding</span>
                     <span class="switch-description">Re-encode the GAN waveform before diffusion.</span>
                   </span>
                   <label class="switch">
-                    <input id="second_encoding" type="checkbox" aria-label="Enable second encoding">
+                    <input class="diffusion-control" id="second_encoding" type="checkbox" aria-label="Enable second encoding">
                     <span class="switch-track" aria-hidden="true"></span>
                   </label>
                 </div>
@@ -1241,12 +1263,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
                   </div>
                   <div class="field">
                     <label for="diffusion_steps">Diffusion Steps</label>
-                    <input class="control" id="diffusion_steps" type="number" value="100" min="2" max="1000" step="1" required>
+                    <input class="control diffusion-control" id="diffusion_steps" type="number" value="100" min="2" max="1000" step="1" required>
                     <span class="field-hint">Schedule depth</span>
                   </div>
                   <div class="field">
                     <label for="diffusion_speedup">Diffusion Speedup</label>
-                    <input class="control" id="diffusion_speedup" type="number" value="10" min="1" max="50" step="1" required>
+                    <input class="control diffusion-control" id="diffusion_speedup" type="number" value="10" min="1" max="50" step="1" required>
                     <span class="field-hint">Steps ÷ speedup ≥ 2</span>
                   </div>
                 </div>
@@ -1331,6 +1353,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     const errorMessage = byId("error-message");
     const slicing = byId("slicing");
     const sliceFields = byId("slice-fields");
+    const shallowDiffusion = byId("shallow_diffusion");
     const pitchShift = byId("pitch_shift");
     const diffusionSteps = byId("diffusion_steps");
     const diffusionSpeedup = byId("diffusion_speedup");
@@ -1382,6 +1405,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
       });
     }
 
+    function updateDiffusionState() {
+      document.querySelectorAll(".diffusion-control").forEach((control) => {
+        control.disabled = !shallowDiffusion.checked;
+      });
+    }
+
     function updateSpeedupLimit() {
       const steps = Number(diffusionSteps.value);
       const maximum = Math.max(1, Math.floor(steps / 2));
@@ -1426,6 +1455,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     });
 
     slicing.addEventListener("change", updateSlicingState);
+    shallowDiffusion.addEventListener("change", updateDiffusionState);
     pitchShift.addEventListener("input", updatePitchButtons);
     document.querySelectorAll("[data-pitch-value]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -1435,6 +1465,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     });
     diffusionSteps.addEventListener("input", updateSpeedupLimit);
     updateSlicingState();
+    updateDiffusionState();
     updatePitchButtons();
     updateSpeedupLimit();
 
@@ -1467,6 +1498,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         "crossfade_ratio"
       ].forEach((name) => body.append(name, byId(name).value));
       body.append("predict_f0", String(byId("predict_f0").checked));
+      body.append("shallow_diffusion", String(shallowDiffusion.checked));
       body.append("second_encoding", String(byId("second_encoding").checked));
       body.append("slicing", String(slicing.checked));
 

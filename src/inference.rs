@@ -25,6 +25,7 @@ pub struct InferenceOptions {
     pub pitch_shift: f32,
     pub noise_scale: f32,
     pub predict_f0: bool,
+    pub shallow_diffusion: bool,
     pub diffusion_steps: i32,
     pub diffusion_speedup: i32,
     pub loudness_envelope_adjustment: f32,
@@ -37,6 +38,7 @@ impl Default for InferenceOptions {
             pitch_shift: 0.0,
             noise_scale: 0.4,
             predict_f0: false,
+            shallow_diffusion: false,
             diffusion_steps: 100,
             diffusion_speedup: 10,
             loudness_envelope_adjustment: 1.0,
@@ -70,9 +72,9 @@ impl Default for SliceInferenceOptions {
 pub struct InferenceOutput {
     pub audio: Array,
     pub gan_audio: Array,
-    pub refined_mel: Array,
+    pub refined_mel: Option<Array>,
     pub content: Array,
-    pub diffusion_content: Array,
+    pub diffusion_content: Option<Array>,
     pub f0: Array,
     pub uv: Array,
     pub volume: Array,
@@ -141,14 +143,16 @@ impl SovitsSvc {
             options.noise_scale >= 0.0,
             "GAN noise scale must be non-negative"
         );
-        ensure!(
-            options.diffusion_steps >= 2,
-            "diffusion step count must be at least 2"
-        );
-        ensure!(
-            options.diffusion_speedup > 0,
-            "diffusion speedup must be positive"
-        );
+        if options.shallow_diffusion {
+            ensure!(
+                options.diffusion_steps >= 2,
+                "diffusion step count must be at least 2"
+            );
+            ensure!(
+                options.diffusion_speedup > 0,
+                "diffusion speedup must be positive"
+            );
+        }
         let resampled_audio = self.resample_input(audio, sample_rate)?;
         let frame_count = resampled_audio.shape()[1] / HOP_SIZE;
         ensure!(frame_count > 0, "input is shorter than one model frame");
@@ -182,41 +186,46 @@ impl SovitsSvc {
         )?;
         gan.audio.eval()?;
 
-        let gan_waveform = gan.audio.squeeze_axes(&[-1])?;
-        let initial_mel = self.vocoder.mel.extract(&gan_waveform)?;
-        let f0 = gan.f0.expand_dims(-1)?;
-        let volume_condition = volume.expand_dims(-1)?;
-        let diffusion_content = if options.second_encoding {
-            let wav_16k = self.encoder_resampler.resample(&gan_waveform)?;
-            let encoded = self.contentvec.encode(&wav_16k)?;
-            ContentVec::expand_nearest(&encoded, gan.f0.shape()[1])?
+        let (output, refined_mel, diffusion_content) = if options.shallow_diffusion {
+            let gan_waveform = gan.audio.squeeze_axes(&[-1])?;
+            let initial_mel = self.vocoder.mel.extract(&gan_waveform)?;
+            let f0 = gan.f0.expand_dims(-1)?;
+            let volume_condition = volume.expand_dims(-1)?;
+            let diffusion_content = if options.second_encoding {
+                let wav_16k = self.encoder_resampler.resample(&gan_waveform)?;
+                let encoded = self.contentvec.encode(&wav_16k)?;
+                ContentVec::expand_nearest(&encoded, gan.f0.shape()[1])?
+            } else {
+                content.clone()
+            };
+            let condition = self
+                .diffusion
+                .condition(&diffusion_content, &f0, &volume_condition)?;
+            let normalized = self
+                .diffusion
+                .norm_spec(&initial_mel)?
+                .swap_axes(1, 2)?
+                .expand_dims(1)?;
+            let diffusion_noise = normal::<f32>(normalized.shape(), None, None, None)?;
+            let timestep = Array::from_int(options.diffusion_steps - 1).reshape(&[1])?;
+            let noisy = self
+                .diffusion
+                .q_sample(&normalized, &timestep, &diffusion_noise)?;
+            let refined = self.diffusion.sample_dpm_solver_pp(
+                &noisy,
+                &condition,
+                options.diffusion_steps,
+                options.diffusion_speedup,
+            )?;
+            let refined_mel = self
+                .diffusion
+                .denorm_spec(&refined.squeeze_axes(&[1])?.swap_axes(1, 2)?)?;
+            let vocoder_f0 = gan.f0.index((.., ..refined_mel.shape()[1]));
+            let output = self.vocoder.infer(&refined_mel, &vocoder_f0)?;
+            (output, Some(refined_mel), Some(diffusion_content))
         } else {
-            content.clone()
+            (gan.audio.clone(), None, None)
         };
-        let condition = self
-            .diffusion
-            .condition(&diffusion_content, &f0, &volume_condition)?;
-        let normalized = self
-            .diffusion
-            .norm_spec(&initial_mel)?
-            .swap_axes(1, 2)?
-            .expand_dims(1)?;
-        let diffusion_noise = normal::<f32>(normalized.shape(), None, None, None)?;
-        let timestep = Array::from_int(options.diffusion_steps - 1).reshape(&[1])?;
-        let noisy = self
-            .diffusion
-            .q_sample(&normalized, &timestep, &diffusion_noise)?;
-        let refined = self.diffusion.sample_dpm_solver_pp(
-            &noisy,
-            &condition,
-            options.diffusion_steps,
-            options.diffusion_speedup,
-        )?;
-        let refined_mel = self
-            .diffusion
-            .denorm_spec(&refined.squeeze_axes(&[1])?.swap_axes(1, 2)?)?;
-        let vocoder_f0 = gan.f0.index((.., ..refined_mel.shape()[1]));
-        let output = self.vocoder.infer(&refined_mel, &vocoder_f0)?;
         let output = if options.loudness_envelope_adjustment != 1.0 {
             adjust_loudness_envelope(
                 &resampled_audio,
