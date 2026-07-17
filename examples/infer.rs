@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sovits_svc_mlx::audio::{load_audio_first_channel, write_wav_float};
+use sovits_svc_mlx::audio::{load_audio, write_wav_float};
 use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SliceInferenceOptions, SovitsSvc};
 
 #[derive(Debug, Parser)]
@@ -12,7 +12,7 @@ use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SliceInferenceOptions
     about = "Run so-vits-svc GAN inference with optional MLX refiners"
 )]
 struct Arguments {
-    /// Input audio file supported by Babycat, sampled at 44.1 or 48 kHz.
+    /// Input audio file supported by the statically linked FFmpeg build, sampled at 44.1 or 48 kHz.
     input: PathBuf,
 
     /// Converted GAN checkpoint.
@@ -141,7 +141,7 @@ fn output_path(input: &Path) -> Result<PathBuf> {
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let output_path = output_path(&arguments.input)?;
-    let input = load_audio_first_channel(&arguments.input)?;
+    let input = load_audio(&arguments.input)?;
     let mut model = SovitsSvc::load(
         &arguments.gan_checkpoint,
         &arguments.shallow_diffusion_checkpoint,

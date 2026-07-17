@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{abs, max};
-use sovits_svc_mlx::audio::{load_audio_first_channel, write_wav_float};
+use sovits_svc_mlx::audio::{load_audio, write_wav_float};
 use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SovitsSvc};
 use sovits_svc_mlx::refine::FlowMatchingRefiner;
 
@@ -28,7 +28,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct InferArguments {
-    /// Input audio supported by Babycat, sampled at 44.1 or 48 kHz.
+    /// Input audio supported by the statically linked FFmpeg build, sampled at 44.1 or 48 kHz.
     input: PathBuf,
 
     /// Converted opencpop GAN checkpoint.
@@ -144,7 +144,7 @@ fn infer(arguments: InferArguments) -> Result<()> {
         "flow matching step count must be positive"
     );
     let output_path = output_path(&arguments.input)?;
-    let input = load_audio_first_channel(&arguments.input)?;
+    let input = load_audio(&arguments.input)?;
     let mut model = SovitsSvc::load(
         arguments.gan_checkpoint,
         arguments.shallow_diffusion_checkpoint,

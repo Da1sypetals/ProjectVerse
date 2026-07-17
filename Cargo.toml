@@ -6,13 +6,14 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.103"
 axum = { version = "0.8.9", features = ["multipart"] }
-babycat = { version = "0.0.15", default-features = false, features = ["frontend-rust"] }
+bytemuck = "1.25.1"
 clap = { version = "4.6.1", features = ["derive"] }
 fcpe-mlxrs = { version = "0.1.0", path = "fcpe-mlx" }
+ffmpeg-the-third = { version = "5.0.0", default-features = false, features = ["codec", "format", "software-resampling", "build"] }
 hound = "3.5.1"
+libc = "0.2.186"
 mlx-rs = { git = "https://github.com/blossom-slopware/mlx-rs.git", rev = "b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d", features = ["accelerate", "metal"] }
 percent-encoding = "2.3.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-symphonia = { version = "0.5.5", features = ["aac", "alac", "flac", "mp3", "mkv", "pcm", "isomp4", "wav", "ogg", "vorbis"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }

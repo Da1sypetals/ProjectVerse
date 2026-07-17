@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use clap::Parser;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use sovits_svc_mlx::audio::{load_audio_bytes_first_channel, wav_float_bytes};
+use sovits_svc_mlx::audio::{load_audio_bytes, wav_float_bytes};
 use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SliceInferenceOptions, SovitsSvc};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -192,7 +192,7 @@ fn content_disposition(output_name: &str) -> HeaderValue {
 fn process_request(model: &mut SovitsSvc, request: EngineRequest) {
     let started = Instant::now();
     let result = (|| -> Result<EngineReply> {
-        let input = load_audio_bytes_first_channel(
+        let input = load_audio_bytes(
             &request.input.bytes,
             &request.input.file_extension,
             &request.input.mime_type,
