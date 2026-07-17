@@ -128,13 +128,27 @@ impl ResidualBlock {
 }
 
 #[derive(Debug)]
-pub struct WaveNet {
+pub(super) struct WaveNet {
     input_projection: Conv1d,
     diffusion_mlp_in: Linear,
     diffusion_mlp_out: Linear,
     residual_layers: Vec<ResidualBlock>,
     skip_projection: Conv1d,
     output_projection: Conv1d,
+}
+
+#[derive(Debug)]
+pub struct WaveNetTrace {
+    pub input_projection: Array,
+    pub diffusion_embedding: Array,
+    pub mlp_in: Array,
+    pub mlp_mish: Array,
+    pub mlp_out: Array,
+    pub residuals: Vec<Array>,
+    pub skips: Vec<Array>,
+    pub skip_projection: Array,
+    pub output_projection: Array,
+    pub output: Array,
 }
 
 impl WaveNet {
@@ -189,70 +203,100 @@ impl WaveNet {
         })
     }
 
-    pub fn forward(&mut self, spec: &Array, diffusion_step: &Array, cond: &Array) -> Result<Array> {
+    fn run(
+        &mut self,
+        spec: &Array,
+        diffusion_step: &Array,
+        cond: &Array,
+        capture_trace: bool,
+    ) -> Result<(Array, Option<WaveNetTrace>)> {
         let spec = spec.squeeze_axes(&[1])?.swap_axes(1, 2)?;
-        let mut x = nn::relu(self.input_projection.forward(&spec)?)?;
+        let input_projection = self.input_projection.forward(&spec)?;
+        let mut x = nn::relu(&input_projection)?;
 
         let half_dim = RESIDUAL_CHANNELS / 2;
         let frequencies = exp(&(Array::arange::<_, f32>(None, half_dim, None)?
             * (-10000.0_f32.ln() / (half_dim - 1) as f32)))?;
         let phase =
             diffusion_step.as_type::<f32>()?.expand_dims(-1)? * frequencies.expand_dims(0)?;
-        let embedding = concatenate_axis(&[sin(&phase)?, cos(&phase)?], -1)?;
-        let embedding = self.diffusion_mlp_in.forward(&embedding)?;
-        let embedding = nn::mish(&embedding)?;
-        let embedding = self.diffusion_mlp_out.forward(&embedding)?;
+        let diffusion_embedding = concatenate_axis(&[sin(&phase)?, cos(&phase)?], -1)?;
+        let mlp_in = self.diffusion_mlp_in.forward(&diffusion_embedding)?;
+        let mlp_mish = nn::mish(&mlp_in)?;
+        let embedding = self.diffusion_mlp_out.forward(&mlp_mish)?;
 
         let mut skips = Vec::with_capacity(self.residual_layers.len());
+        let mut residuals = Vec::with_capacity(self.residual_layers.len());
         for layer in &mut self.residual_layers {
             let (next_x, skip) = layer.forward(&x, cond, &embedding)?;
             x = next_x;
+            if capture_trace {
+                residuals.push(x.clone());
+            }
             skips.push(skip);
         }
         let skip_refs = skips.iter().collect::<Vec<_>>();
         x = sum_axis(stack_axis(&skip_refs, 0)?, 0, false)?
             / (self.residual_layers.len() as f32).sqrt();
-        x = self.skip_projection.forward(&x)?;
-        x = nn::relu(x)?;
-        x = self.output_projection.forward(&x)?;
-        Ok(x.swap_axes(1, 2)?.expand_dims(1)?)
+        let skip_projection = self.skip_projection.forward(&x)?;
+        x = nn::relu(&skip_projection)?;
+        let output_projection = self.output_projection.forward(&x)?;
+        let output = output_projection.swap_axes(1, 2)?.expand_dims(1)?;
+        let trace = capture_trace.then(|| WaveNetTrace {
+            input_projection,
+            diffusion_embedding,
+            mlp_in,
+            mlp_mish,
+            mlp_out: embedding,
+            residuals,
+            skips,
+            skip_projection,
+            output_projection,
+            output: output.clone(),
+        });
+        Ok((output, trace))
+    }
+
+    pub fn forward(&mut self, spec: &Array, diffusion_step: &Array, cond: &Array) -> Result<Array> {
+        Ok(self.run(spec, diffusion_step, cond, false)?.0)
+    }
+
+    pub fn forward_with_trace(
+        &mut self,
+        spec: &Array,
+        diffusion_step: &Array,
+        cond: &Array,
+    ) -> Result<WaveNetTrace> {
+        Ok(self
+            .run(spec, diffusion_step, cond, true)?
+            .1
+            .expect("WaveNet trace capture must return a trace"))
     }
 }
 
 #[derive(Debug)]
-pub struct DiffusionSchedule {
+pub(super) struct DiffusionSchedule {
     pub betas: Array,
-    pub alphas_cumprod: Array,
-    pub alphas_cumprod_prev: Array,
     pub sqrt_alphas_cumprod: Array,
     pub sqrt_one_minus_alphas_cumprod: Array,
-    pub log_one_minus_alphas_cumprod: Array,
-    pub sqrt_recip_alphas_cumprod: Array,
-    pub sqrt_recipm1_alphas_cumprod: Array,
-    pub posterior_variance: Array,
-    pub posterior_log_variance_clipped: Array,
-    pub posterior_mean_coef1: Array,
-    pub posterior_mean_coef2: Array,
     pub spec_min: Array,
     pub spec_max: Array,
 }
 
 impl DiffusionSchedule {
     fn load(weights: &mut Weights) -> Result<Self> {
+        weights.take("decoder.alphas_cumprod")?;
+        weights.take("decoder.alphas_cumprod_prev")?;
+        weights.take("decoder.log_one_minus_alphas_cumprod")?;
+        weights.take("decoder.sqrt_recip_alphas_cumprod")?;
+        weights.take("decoder.sqrt_recipm1_alphas_cumprod")?;
+        weights.take("decoder.posterior_variance")?;
+        weights.take("decoder.posterior_log_variance_clipped")?;
+        weights.take("decoder.posterior_mean_coef1")?;
+        weights.take("decoder.posterior_mean_coef2")?;
         Ok(Self {
             betas: weights.take("decoder.betas")?,
-            alphas_cumprod: weights.take("decoder.alphas_cumprod")?,
-            alphas_cumprod_prev: weights.take("decoder.alphas_cumprod_prev")?,
             sqrt_alphas_cumprod: weights.take("decoder.sqrt_alphas_cumprod")?,
             sqrt_one_minus_alphas_cumprod: weights.take("decoder.sqrt_one_minus_alphas_cumprod")?,
-            log_one_minus_alphas_cumprod: weights.take("decoder.log_one_minus_alphas_cumprod")?,
-            sqrt_recip_alphas_cumprod: weights.take("decoder.sqrt_recip_alphas_cumprod")?,
-            sqrt_recipm1_alphas_cumprod: weights.take("decoder.sqrt_recipm1_alphas_cumprod")?,
-            posterior_variance: weights.take("decoder.posterior_variance")?,
-            posterior_log_variance_clipped: weights
-                .take("decoder.posterior_log_variance_clipped")?,
-            posterior_mean_coef1: weights.take("decoder.posterior_mean_coef1")?,
-            posterior_mean_coef2: weights.take("decoder.posterior_mean_coef2")?,
             spec_min: weights.take("decoder.spec_min")?,
             spec_max: weights.take("decoder.spec_max")?,
         })
@@ -260,27 +304,25 @@ impl DiffusionSchedule {
 }
 
 #[derive(Debug)]
-pub struct DiffusionModel {
+pub(super) struct Unit2Mel {
     unit_embed: Linear,
     f0_embed: Linear,
     volume_embed: Linear,
-    aug_shift_embed: Linear,
+    _aug_shift_embed: Linear,
     pub schedule: DiffusionSchedule,
     pub denoiser: WaveNet,
 }
 
-impl DiffusionModel {
-    pub fn load(mut weights: Weights) -> Result<Self> {
-        let model = Self {
+impl Unit2Mel {
+    pub(super) fn load(weights: &mut Weights) -> Result<Self> {
+        Ok(Self {
             unit_embed: weights.linear("unit_embed", 768, HIDDEN_CHANNELS, true)?,
             f0_embed: weights.linear("f0_embed", 1, HIDDEN_CHANNELS, true)?,
             volume_embed: weights.linear("volume_embed", 1, HIDDEN_CHANNELS, true)?,
-            aug_shift_embed: weights.linear("aug_shift_embed", 1, HIDDEN_CHANNELS, false)?,
-            schedule: DiffusionSchedule::load(&mut weights)?,
-            denoiser: WaveNet::load(&mut weights)?,
-        };
-        weights.finish()?;
-        Ok(model)
+            _aug_shift_embed: weights.linear("aug_shift_embed", 1, HIDDEN_CHANNELS, false)?,
+            schedule: DiffusionSchedule::load(weights)?,
+            denoiser: WaveNet::load(weights)?,
+        })
     }
 
     pub fn condition(&mut self, units: &Array, f0: &Array, volume: &Array) -> Result<Array> {
@@ -288,10 +330,6 @@ impl DiffusionModel {
         let f0 = self.f0_embed.forward(&log1p(&(f0 / 700.0_f32))?)?;
         let volume = self.volume_embed.forward(volume)?;
         Ok(units + f0 + volume)
-    }
-
-    pub fn pitch_shift_condition(&mut self, shift: &Array) -> Result<Array> {
-        Ok(self.aug_shift_embed.forward(&(shift / 5.0_f32))?)
     }
 
     pub fn q_sample(&self, x_start: &Array, timestep: &Array, noise: &Array) -> Result<Array> {

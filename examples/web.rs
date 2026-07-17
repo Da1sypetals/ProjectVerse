@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use clap::Parser;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sovits_svc_mlx::audio::{load_audio_bytes_first_channel, wav_float_bytes};
-use sovits_svc_mlx::inference::{InferenceOptions, SliceInferenceOptions, SovitsSvc};
+use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SliceInferenceOptions, SovitsSvc};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -25,13 +25,41 @@ const OUTPUT_SAMPLE_RATE: u32 = 44_100;
 #[derive(Debug, Parser)]
 #[command(version, about = "Serve the local so-vits-svc MLX inference interface")]
 struct Arguments {
-    /// Directory containing the converted GAN, diffusion, ContentVec, and vocoder weights.
-    #[arg(long, default_value = "artifacts")]
-    artifact_dir: PathBuf,
+    /// Converted GAN checkpoint.
+    #[arg(long, default_value = "../ckpt/mlx/gan/opencpop/model.safetensors")]
+    gan_checkpoint: PathBuf,
+
+    /// Converted shallow-diffusion checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/refine/shallow_diffusion/guan/model.safetensors"
+    )]
+    shallow_diffusion_checkpoint: PathBuf,
+
+    /// Converted Flow Matching checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/refine/flow_matching/opencpop/model.safetensors"
+    )]
+    flow_matching_checkpoint: PathBuf,
+
+    /// Converted ContentVec checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/encoder/contentvec/model.safetensors"
+    )]
+    contentvec_checkpoint: PathBuf,
 
     /// FCPE MLX safetensors checkpoint.
-    #[arg(long, default_value = "../ckpt/fcpe.safetensors")]
+    #[arg(long, default_value = "../ckpt/mlx/pitch/fcpe/model.safetensors")]
     fcpe_checkpoint: PathBuf,
+
+    /// Converted NSF-HiFiGAN checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/vocoder/nsf_hifigan/model.safetensors"
+    )]
+    vocoder_checkpoint: PathBuf,
 
     /// Address used by the local web server.
     #[arg(long, default_value = "127.0.0.1:3000")]
@@ -85,6 +113,7 @@ impl Default for WebParameters {
     }
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -118,6 +147,17 @@ where
     value
         .parse::<T>()
         .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("Invalid {name}: {error}")))
+}
+
+fn parse_input_gain(value: &str) -> std::result::Result<i32, ApiError> {
+    let input_gain = parse_field("input_gain", value)?;
+    if !(-12..=12).contains(&input_gain) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "input_gain must be an integer between -12 and 12 dB",
+        ));
+    }
+    Ok(input_gain)
 }
 
 fn output_name(input_name: &str) -> String {
@@ -186,8 +226,12 @@ fn process_request(model: &mut SovitsSvc, request: EngineRequest) {
 }
 
 fn spawn_engine(
-    artifact_dir: PathBuf,
+    gan_checkpoint: PathBuf,
+    shallow_diffusion_checkpoint: PathBuf,
+    flow_matching_checkpoint: PathBuf,
+    contentvec_checkpoint: PathBuf,
     fcpe_checkpoint: PathBuf,
+    vocoder_checkpoint: PathBuf,
 ) -> Result<(mpsc::Sender<EngineRequest>, thread::JoinHandle<()>)> {
     let (sender, mut receiver) = mpsc::channel::<EngineRequest>(1);
     let (ready_sender, ready_receiver) =
@@ -196,11 +240,12 @@ fn spawn_engine(
         .name("sovits-mlx-inference".to_owned())
         .spawn(move || {
             let model = SovitsSvc::load(
-                artifact_dir.join("gan.safetensors"),
-                artifact_dir.join("diffusion.safetensors"),
-                artifact_dir.join("contentvec.safetensors"),
+                gan_checkpoint,
+                shallow_diffusion_checkpoint,
+                flow_matching_checkpoint,
+                contentvec_checkpoint,
                 fcpe_checkpoint,
-                artifact_dir.join("vocoder.safetensors"),
+                vocoder_checkpoint,
             );
             let mut model = match model {
                 Ok(model) => model,
@@ -296,6 +341,9 @@ async fn infer(
             )
         })?;
         match name.as_str() {
+            "input_gain" => {
+                parameters.inference.input_gain_db = parse_input_gain(&value)?;
+            }
             "pitch_shift" => {
                 parameters.inference.pitch_shift = parse_field(&name, &value)?;
             }
@@ -305,14 +353,34 @@ async fn infer(
             "predict_f0" => {
                 parameters.inference.predict_f0 = parse_field(&name, &value)?;
             }
+            "refiner" => {
+                parameters.inference.refiner = match value.as_str() {
+                    "none" => Refiner::None,
+                    "shallow_diffusion" => Refiner::ShallowDiffusion,
+                    "flow_matching" => Refiner::FlowMatching,
+                    _ => {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            format!("Invalid refiner: {value}"),
+                        ));
+                    }
+                };
+            }
             "shallow_diffusion" => {
-                parameters.inference.shallow_diffusion = parse_field(&name, &value)?;
+                parameters.inference.refiner = if parse_field(&name, &value)? {
+                    Refiner::ShallowDiffusion
+                } else {
+                    Refiner::None
+                };
             }
             "diffusion_steps" => {
                 parameters.inference.diffusion_steps = parse_field(&name, &value)?;
             }
             "diffusion_speedup" => {
                 parameters.inference.diffusion_speedup = parse_field(&name, &value)?;
+            }
+            "flow_matching_steps" => {
+                parameters.inference.flow_matching_steps = parse_field(&name, &value)?;
             }
             "loudness_envelope_adjustment" => {
                 parameters.inference.loudness_envelope_adjustment = parse_field(&name, &value)?;
@@ -431,7 +499,14 @@ fn main() -> Result<()> {
         .max_upload_mib
         .checked_mul(1024 * 1024)
         .context("maximum upload size is too large")?;
-    let (engine, engine_thread) = spawn_engine(arguments.artifact_dir, arguments.fcpe_checkpoint)?;
+    let (engine, engine_thread) = spawn_engine(
+        arguments.gan_checkpoint,
+        arguments.shallow_diffusion_checkpoint,
+        arguments.flow_matching_checkpoint,
+        arguments.contentvec_checkpoint,
+        arguments.fcpe_checkpoint,
+        arguments.vocoder_checkpoint,
+    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -451,12 +526,14 @@ mod tests {
     #[test]
     fn web_defaults_match_reference_interfaces() {
         let parameters = WebParameters::default();
+        assert_eq!(parameters.inference.input_gain_db, 0);
         assert_eq!(parameters.inference.pitch_shift, 0.0);
         assert_eq!(parameters.inference.noise_scale, 0.4);
         assert!(!parameters.inference.predict_f0);
-        assert!(!parameters.inference.shallow_diffusion);
+        assert_eq!(parameters.inference.refiner, Refiner::None);
         assert_eq!(parameters.inference.diffusion_steps, 100);
         assert_eq!(parameters.inference.diffusion_speedup, 10);
+        assert_eq!(parameters.inference.flow_matching_steps, 50);
         assert_eq!(parameters.inference.loudness_envelope_adjustment, 0.0);
         assert!(!parameters.inference.second_encoding);
         assert!(parameters.slicing);
@@ -473,6 +550,58 @@ mod tests {
         assert_eq!(output_name("声音.flac"), "声音-converted.wav");
         assert_eq!(output_name("audio"), "audio-converted.wav");
     }
+
+    #[test]
+    fn input_gain_accepts_only_integer_values_in_range() {
+        assert_eq!(parse_input_gain("-12").unwrap(), -12);
+        assert_eq!(parse_input_gain("0").unwrap(), 0);
+        assert_eq!(parse_input_gain("12").unwrap(), 12);
+        assert!(parse_input_gain("-13").is_err());
+        assert!(parse_input_gain("13").is_err());
+        assert!(parse_input_gain("1.5").is_err());
+    }
+
+    #[test]
+    fn checkpoint_defaults_use_role_directories() {
+        let arguments = Arguments::try_parse_from(["web"]).unwrap();
+        assert_eq!(
+            arguments.gan_checkpoint,
+            PathBuf::from("../ckpt/mlx/gan/opencpop/model.safetensors")
+        );
+        assert_eq!(
+            arguments.flow_matching_checkpoint,
+            PathBuf::from("../ckpt/mlx/refine/flow_matching/opencpop/model.safetensors")
+        );
+    }
+
+    #[test]
+    fn interface_exposes_every_refiner_and_unrestricted_file_selection() {
+        assert!(
+            INDEX_HTML
+                .contains(r#"<input class="file-input" id="audio-file" name="audio" type="file">"#)
+        );
+        assert!(INDEX_HTML.contains(r#"<input type="radio" name="refiner" value="none" checked>"#));
+        assert!(
+            INDEX_HTML.contains(r#"<input type="radio" name="refiner" value="shallow_diffusion">"#)
+        );
+        assert!(
+            INDEX_HTML.contains(r#"<input type="radio" name="refiner" value="flow_matching">"#)
+        );
+        assert!(INDEX_HTML.contains(r#"id="shallow-diffusion-parameters" hidden"#));
+        assert!(INDEX_HTML.contains(r#"id="flow-matching-parameters" hidden"#));
+        assert!(INDEX_HTML.contains(r#"id="slicing-parameters""#));
+        assert!(INDEX_HTML.contains(
+            r#"<input class="control" id="input_gain" name="input_gain" type="number" value="0" min="-12" max="12" step="1" required>"#
+        ));
+        assert!(!INDEX_HTML.contains("<select"));
+        assert!(!INDEX_HTML.contains("shallow-diffusion-control"));
+        assert!(!INDEX_HTML.contains("flow-matching-control"));
+        assert!(INDEX_HTML.contains("<title>sovits-svc</title>"));
+        assert!(INDEX_HTML.contains(r#"<h1 id="page-title">so-vits-svc inference</h1>"#));
+        assert!(!INDEX_HTML.contains("Engine Ready"));
+        assert!(!INDEX_HTML.contains("Local Voice Conversion"));
+        assert!(!INDEX_HTML.contains("Babycat-supported"));
+    }
 }
 
 const INDEX_HTML: &str = r##"<!doctype html>
@@ -481,7 +610,8 @@ const INDEX_HTML: &str = r##"<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>So-VITS SVC · MLX Inference</title>
+  <meta name="theme-color" content="#fafafa">
+  <title>sovits-svc</title>
   <style>
     :root {
       --background-100: #ffffff;
@@ -499,11 +629,11 @@ const INDEX_HTML: &str = r##"<!doctype html>
       --blue-100: #f0f7ff;
       --blue-700: #006bff;
       --blue-800: #0059ec;
-      --green-100: #ecfdec;
-      --green-800: #279141;
       --red-100: #ffeeef;
       --red-800: #ea001d;
-      --shadow-raised: 0 2px 2px rgba(0, 0, 0, 0.04);
+      --shadow-raised:
+        0 1px 2px rgba(0, 0, 0, 0.04),
+        0 4px 12px rgba(0, 0, 0, 0.03);
       --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #006bff;
       font-family: Geist, "Helvetica Neue", Arial, sans-serif;
       color: var(--gray-1000);
@@ -512,6 +642,10 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     * {
       box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
     }
 
     body {
@@ -524,11 +658,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
       background-size: 32px 32px;
       font-size: 14px;
       line-height: 20px;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: rgba(0, 0, 0, 0.08);
     }
 
     button,
     input {
       font: inherit;
+      touch-action: manipulation;
     }
 
     button,
@@ -543,108 +680,60 @@ const INDEX_HTML: &str = r##"<!doctype html>
       box-shadow: var(--focus-ring);
     }
 
-    .shell {
-      width: min(1200px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 32px 0 64px;
+    [hidden] {
+      display: none !important;
     }
 
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 48px;
-      margin-bottom: 40px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: -0.28px;
-    }
-
-    .brand-mark {
-      display: grid;
-      place-items: center;
-      width: 28px;
-      height: 28px;
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      top: 12px;
+      left: 12px;
+      padding: 8px 12px;
       border-radius: 6px;
       color: #ffffff;
       background: var(--gray-1000);
-      font-size: 12px;
-      font-weight: 600;
+      text-decoration: none;
+      transform: translateY(-200%);
+      transition: transform 150ms ease;
     }
 
-    .engine-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      height: 32px;
-      padding: 0 10px;
-      border: 1px solid var(--gray-alpha-200);
-      border-radius: 9999px;
-      color: var(--gray-900);
-      background: var(--background-100);
-      font-size: 12px;
-      line-height: 16px;
-      box-shadow: var(--shadow-raised);
+    .skip-link:focus {
+      transform: translateY(0);
     }
 
-    .status-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 9999px;
-      background: var(--green-800);
+    .shell {
+      width: min(1200px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
     }
 
     .intro {
-      max-width: 720px;
-      margin-bottom: 32px;
-    }
-
-    .eyebrow {
-      margin: 0 0 12px;
-      color: var(--gray-900);
-      font-family: "SFMono-Regular", Consolas, monospace;
-      font-size: 12px;
-      line-height: 16px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      margin-bottom: 20px;
     }
 
     h1 {
       margin: 0;
-      font-size: clamp(32px, 5vw, 48px);
+      font-size: clamp(30px, 4vw, 40px);
       font-weight: 600;
       line-height: 1.08;
-      letter-spacing: -2.4px;
-    }
-
-    .intro-copy {
-      margin: 16px 0 0;
-      max-width: 620px;
-      color: var(--gray-900);
-      font-size: 16px;
-      line-height: 24px;
+      letter-spacing: -1.8px;
     }
 
     .layout {
       display: grid;
       grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
-      gap: 16px;
+      gap: 14px;
       align-items: start;
     }
 
     .stack {
       display: grid;
-      gap: 16px;
+      gap: 14px;
     }
 
     .card {
-      border: 1px solid var(--gray-alpha-200);
+      border: 1px solid rgba(0, 0, 0, 0.12);
       border-radius: 12px;
       background: var(--background-100);
       box-shadow: var(--shadow-raised);
@@ -653,10 +742,10 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     .card-header {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      padding: 20px 24px;
+      gap: 12px;
+      padding: 14px 20px;
       border-bottom: 1px solid var(--gray-alpha-100);
     }
 
@@ -664,28 +753,28 @@ const INDEX_HTML: &str = r##"<!doctype html>
       margin: 0;
       font-size: 16px;
       font-weight: 600;
-      line-height: 24px;
+      line-height: 22px;
       letter-spacing: -0.32px;
     }
 
-    .card-description {
-      margin: 4px 0 0;
-      color: var(--gray-900);
-      font-size: 13px;
-      line-height: 18px;
+    .card-body {
+      padding: 20px;
     }
 
-    .card-body {
-      padding: 24px;
+    .card-body-switches,
+    .card-body-refiner {
+      padding: 0 20px 20px;
     }
 
     .drop-zone {
       display: grid;
       place-items: center;
-      min-height: 214px;
-      padding: 24px;
+      width: 100%;
+      min-height: 160px;
+      padding: 20px;
       border: 1px dashed var(--gray-500);
       border-radius: 6px;
+      color: var(--gray-1000);
       background: var(--background-200);
       text-align: center;
       cursor: pointer;
@@ -705,7 +794,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
       place-items: center;
       width: 40px;
       height: 40px;
-      margin: 0 auto 16px;
+      margin: 0 auto 12px;
       border: 1px solid var(--gray-alpha-200);
       border-radius: 6px;
       background: var(--background-100);
@@ -719,13 +808,6 @@ const INDEX_HTML: &str = r##"<!doctype html>
       font-size: 14px;
       font-weight: 600;
       line-height: 20px;
-    }
-
-    .drop-copy {
-      margin: 4px 0 0;
-      color: var(--gray-900);
-      font-size: 13px;
-      line-height: 18px;
     }
 
     .file-input {
@@ -770,10 +852,21 @@ const INDEX_HTML: &str = r##"<!doctype html>
       line-height: 16px;
     }
 
+    .field-error {
+      margin: 8px 0 0;
+      color: var(--red-800);
+      font-size: 12px;
+      line-height: 16px;
+    }
+
     .field-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 16px;
+      gap: 14px;
+    }
+
+    .field-grid-two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     .field {
@@ -800,6 +893,83 @@ const INDEX_HTML: &str = r##"<!doctype html>
       line-height: 16px;
     }
 
+    .type-selector {
+      min-width: 0;
+      margin: 16px 0 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .type-selector legend {
+      margin-bottom: 8px;
+      padding: 0;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 16px;
+    }
+
+    .type-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .type-option {
+      position: relative;
+      display: block;
+      height: 100%;
+      min-width: 0;
+      cursor: pointer;
+    }
+
+    .type-option input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+
+    .type-option-body {
+      display: grid;
+      place-items: center;
+      height: 100%;
+      min-height: 44px;
+      padding: 10px;
+      border: 1px solid var(--gray-alpha-200);
+      border-radius: 8px;
+      background: var(--background-100);
+      text-align: center;
+      transition:
+        border-color 150ms ease,
+        box-shadow 150ms ease,
+        background-color 150ms ease;
+    }
+
+    .type-option:hover .type-option-body {
+      border-color: var(--gray-500);
+      background: var(--background-200);
+    }
+
+    .type-option input:checked + .type-option-body {
+      border-color: var(--gray-1000);
+      background: var(--background-100);
+      box-shadow:
+        inset 0 0 0 1px var(--gray-1000),
+        0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+
+    .type-option input:focus-visible + .type-option-body {
+      box-shadow: var(--focus-ring);
+    }
+
+    .type-option-title {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 18px;
+    }
+
     .control {
       width: 100%;
       height: 40px;
@@ -812,12 +982,6 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     .control:hover {
       border-color: var(--gray-500);
-    }
-
-    .control:disabled {
-      color: var(--gray-700);
-      background: var(--gray-100);
-      cursor: not-allowed;
     }
 
     .pitch-control {
@@ -862,14 +1026,19 @@ const INDEX_HTML: &str = r##"<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      gap: 12px;
       min-height: 48px;
       padding: 8px 0;
       border-bottom: 1px solid var(--gray-alpha-100);
+      cursor: pointer;
     }
 
     .switch-row:last-child {
       border-bottom: 0;
+    }
+
+    .switch-row:hover .switch-title {
+      color: var(--blue-800);
     }
 
     .switch-copy {
@@ -880,12 +1049,6 @@ const INDEX_HTML: &str = r##"<!doctype html>
     .switch-title {
       font-size: 13px;
       font-weight: 500;
-      line-height: 16px;
-    }
-
-    .switch-description {
-      color: var(--gray-900);
-      font-size: 12px;
       line-height: 16px;
     }
 
@@ -940,25 +1103,22 @@ const INDEX_HTML: &str = r##"<!doctype html>
       box-shadow: var(--focus-ring);
     }
 
-    .switch input:disabled {
-      cursor: not-allowed;
+    .parameter-panel {
+      display: grid;
+      gap: 14px;
     }
 
-    .switch input:disabled + .switch-track {
-      opacity: 0.52;
-    }
-
-    .slice-fields[aria-disabled="true"] {
-      opacity: 0.52;
+    .parameter-panel-fields {
+      padding-top: 20px;
     }
 
     .action-bar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      margin-top: 16px;
-      padding: 16px;
+      gap: 14px;
+      margin-top: 14px;
+      padding: 14px;
       border: 1px solid var(--gray-alpha-200);
       border-radius: 12px;
       background: var(--background-100);
@@ -998,10 +1158,23 @@ const INDEX_HTML: &str = r##"<!doctype html>
     }
 
     .primary-button:disabled {
-      border-color: var(--gray-100);
-      color: var(--gray-700);
-      background: var(--gray-100);
+      opacity: 0.72;
       cursor: not-allowed;
+    }
+
+    .button-spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #ffffff;
+      border-radius: 9999px;
+      animation: spin 700ms linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
     }
 
     .secondary-button {
@@ -1016,7 +1189,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     .message {
       display: none;
-      margin-top: 16px;
+      margin-top: 14px;
       padding: 12px 16px;
       border: 1px solid;
       border-radius: 6px;
@@ -1036,7 +1209,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     .result {
       display: none;
-      margin-top: 16px;
+      margin-top: 14px;
     }
 
     .result.is-visible {
@@ -1046,7 +1219,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     .result-content {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: 16px;
+      gap: 14px;
       align-items: center;
     }
 
@@ -1064,7 +1237,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     audio {
       width: 100%;
       height: 40px;
-      margin-top: 16px;
+      margin-top: 14px;
     }
 
     @media (max-width: 960px) {
@@ -1078,30 +1251,53 @@ const INDEX_HTML: &str = r##"<!doctype html>
     }
 
     @media (max-width: 600px) {
+      input {
+        font-size: 16px;
+      }
+
       .shell {
         width: min(100% - 24px, 1200px);
         padding-top: 16px;
       }
 
-      .topbar {
-        margin-bottom: 32px;
-      }
-
       .intro {
-        margin-bottom: 24px;
+        margin-bottom: 16px;
       }
 
       h1 {
         letter-spacing: -1.28px;
       }
 
-      .card-header,
+      .card-header {
+        padding: 12px 16px;
+      }
+
       .card-body {
         padding: 16px;
       }
 
+      .card-body-switches,
+      .card-body-refiner {
+        padding: 0 16px 16px;
+      }
+
+      .parameter-panel-fields {
+        padding-top: 16px;
+      }
+
       .field-grid {
         grid-template-columns: 1fr;
+      }
+
+      .type-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .control,
+      .pitch-button,
+      .primary-button,
+      .secondary-button {
+        min-height: 44px;
       }
 
       .action-bar,
@@ -1126,32 +1322,17 @@ const INDEX_HTML: &str = r##"<!doctype html>
       *::after {
         scroll-behavior: auto !important;
         transition-duration: 0ms !important;
+        animation-duration: 0ms !important;
       }
     }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to Content</a>
   <div class="shell">
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true">S</span>
-        <span>So-VITS SVC · MLX</span>
-      </div>
-      <div class="engine-status" role="status">
-        <span class="status-dot" aria-hidden="true"></span>
-        Engine Ready
-      </div>
-    </header>
-
-    <main>
+    <main id="main-content">
       <section class="intro" aria-labelledby="page-title">
-        <p class="eyebrow">Local Voice Conversion</p>
-        <h1 id="page-title">Convert a voice.</h1>
-        <p class="intro-copy">
-          Run the complete GAN and shallow-diffusion pipeline locally with MLX.
-          Upload supported audio at 44.1 or 48 kHz, tune every inference parameter,
-          then download the converted result.
-        </p>
+        <h1 id="page-title">so-vits-svc inference</h1>
       </section>
 
       <form id="inference-form">
@@ -1159,75 +1340,70 @@ const INDEX_HTML: &str = r##"<!doctype html>
           <div class="stack">
             <section class="card" aria-labelledby="input-title">
               <div class="card-header">
-                <div>
-                  <h2 class="card-title" id="input-title">Input Audio</h2>
-                  <p class="card-description">Babycat-supported audio at 44.1 or 48 kHz. The first channel is used.</p>
-                </div>
+                <h2 class="card-title" id="input-title">Input Audio</h2>
               </div>
               <div class="card-body">
-                <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-controls="audio-file">
+                <button class="drop-zone" id="drop-zone" type="button" aria-controls="audio-file">
                   <div>
                     <span class="upload-symbol" aria-hidden="true">↑</span>
                     <p class="drop-title">Drop an audio file here</p>
-                    <p class="drop-copy">or select a file from this device</p>
                   </div>
-                </div>
-                <input class="file-input" id="audio-file" type="file" accept="audio/*,.aac,.alac,.flac,.m4a,.mka,.mkv,.mp3,.mp4,.oga,.ogg,.wav,video/mp4,video/x-matroska">
-                <div class="file-summary" id="file-summary">
+                </button>
+                <input class="file-input" id="audio-file" name="audio" type="file">
+                <div class="file-summary" id="file-summary" role="status" aria-live="polite">
                   <span class="file-name" id="file-name"></span>
                   <span class="file-size" id="file-size"></span>
                 </div>
+                <p class="field-error" id="file-error" role="alert" hidden>Choose an audio file before running inference.</p>
               </div>
             </section>
 
             <section class="card" aria-labelledby="behavior-title">
               <div class="card-header">
-                <div>
-                  <h2 class="card-title" id="behavior-title">Pipeline Behavior</h2>
-                  <p class="card-description">Optional model paths that change the inference flow.</p>
-                </div>
+                <h2 class="card-title" id="behavior-title">Pipeline</h2>
               </div>
-              <div class="card-body">
-                <div class="switch-row">
+              <div class="card-body card-body-switches">
+                <label class="switch-row" for="predict_f0">
                   <span class="switch-copy">
                     <span class="switch-title">Automatic F0</span>
-                    <span class="switch-description">Use the GAN F0 decoder after FCPE conditioning.</span>
                   </span>
-                  <label class="switch">
-                    <input id="predict_f0" type="checkbox" aria-label="Enable automatic F0">
+                  <span class="switch">
+                    <input id="predict_f0" name="predict_f0" type="checkbox" aria-label="Enable automatic F0">
                     <span class="switch-track" aria-hidden="true"></span>
-                  </label>
-                </div>
-                <div class="switch-row">
-                  <span class="switch-copy">
-                    <span class="switch-title">Shallow Diffusion</span>
-                    <span class="switch-description">Refine the GAN waveform with diffusion and the diffusion vocoder.</span>
                   </span>
-                  <label class="switch">
-                    <input id="shallow_diffusion" type="checkbox" aria-label="Enable shallow diffusion">
-                    <span class="switch-track" aria-hidden="true"></span>
-                  </label>
-                </div>
-                <div class="switch-row">
-                  <span class="switch-copy">
-                    <span class="switch-title">Second Encoding</span>
-                    <span class="switch-description">Re-encode the GAN waveform before diffusion.</span>
-                  </span>
-                  <label class="switch">
-                    <input class="diffusion-control" id="second_encoding" type="checkbox" aria-label="Enable second encoding">
-                    <span class="switch-track" aria-hidden="true"></span>
-                  </label>
-                </div>
-                <div class="switch-row">
+                </label>
+                <label class="switch-row" for="slicing">
                   <span class="switch-copy">
                     <span class="switch-title">Silence Slicing</span>
-                    <span class="switch-description">Preserve silence and process non-silent chunks independently.</span>
                   </span>
-                  <label class="switch">
-                    <input id="slicing" type="checkbox" checked aria-label="Enable silence slicing">
+                  <span class="switch">
+                    <input id="slicing" name="slicing" type="checkbox" checked aria-label="Enable silence slicing">
                     <span class="switch-track" aria-hidden="true"></span>
-                  </label>
-                </div>
+                  </span>
+                </label>
+                <fieldset class="type-selector">
+                  <legend>Refiner Type</legend>
+                  <div class="type-grid">
+                    <label class="type-option">
+                      <input type="radio" name="refiner" value="none" checked>
+                      <span class="type-option-body">
+                        <span class="type-option-title">GAN Only</span>
+                      </span>
+                    </label>
+                    <label class="type-option">
+                      <input type="radio" name="refiner" value="shallow_diffusion">
+                      <span class="type-option-body">
+                        <span class="type-option-title">Shallow Diffusion</span>
+                      </span>
+                    </label>
+                    <label class="type-option">
+                      <input type="radio" name="refiner" value="flow_matching">
+                      <span class="type-option-body">
+                        <span class="type-option-title">Flow Matching</span>
+                      </span>
+                    </label>
+                  </div>
+                </fieldset>
               </div>
             </section>
           </div>
@@ -1235,78 +1411,107 @@ const INDEX_HTML: &str = r##"<!doctype html>
           <div class="stack">
             <section class="card" aria-labelledby="inference-title">
               <div class="card-header">
-                <div>
-                  <h2 class="card-title" id="inference-title">Inference Parameters</h2>
-                  <p class="card-description">Core GAN, pitch, diffusion, and loudness controls.</p>
-                </div>
+                <h2 class="card-title" id="inference-title">Inference Parameters</h2>
               </div>
               <div class="card-body">
-                <div class="field-grid">
+                <div class="field-grid field-grid-two">
+                  <div class="field">
+                    <label for="input_gain">Input Gain</label>
+                    <input class="control" id="input_gain" name="input_gain" type="number" value="0" min="-12" max="12" step="1" required>
+                    <span class="field-hint">dB</span>
+                  </div>
                   <div class="field">
                     <label for="pitch_shift">Pitch Shift</label>
                     <div class="pitch-control">
                       <button class="pitch-button" type="button" data-pitch-value="-12" aria-pressed="false">−12</button>
-                      <input class="control" id="pitch_shift" type="number" value="0" min="-48" max="48" step="1" required>
+                      <input class="control" id="pitch_shift" name="pitch_shift" type="number" value="0" min="-48" max="48" step="1" required>
                       <button class="pitch-button" type="button" data-pitch-value="12" aria-pressed="false">+12</button>
                     </div>
                     <span class="field-hint">Semitones</span>
                   </div>
                   <div class="field">
                     <label for="noise_scale">GAN Noise Scale</label>
-                    <input class="control" id="noise_scale" type="number" value="0.4" min="0" step="0.01" required>
+                    <input class="control" id="noise_scale" name="noise_scale" type="number" value="0.4" min="0" step="0.01" required>
                     <span class="field-hint">Non-negative</span>
                   </div>
                   <div class="field">
                     <label for="loudness_envelope_adjustment">Loudness Envelope</label>
-                    <input class="control" id="loudness_envelope_adjustment" type="number" value="0" min="0" max="1" step="0.05" required>
+                    <input class="control" id="loudness_envelope_adjustment" name="loudness_envelope_adjustment" type="number" value="0" min="0" max="1" step="0.05" required>
                     <span class="field-hint">0–1 strength</span>
-                  </div>
-                  <div class="field">
-                    <label for="diffusion_steps">Diffusion Steps</label>
-                    <input class="control diffusion-control" id="diffusion_steps" type="number" value="100" min="2" max="1000" step="1" required>
-                    <span class="field-hint">Schedule depth</span>
-                  </div>
-                  <div class="field">
-                    <label for="diffusion_speedup">Diffusion Speedup</label>
-                    <input class="control diffusion-control" id="diffusion_speedup" type="number" value="10" min="1" max="50" step="1" required>
-                    <span class="field-hint">Steps ÷ speedup ≥ 2</span>
                   </div>
                 </div>
               </div>
             </section>
 
-            <section class="card" aria-labelledby="slicing-title">
+            <section class="card" id="refiner-parameters" aria-labelledby="refiner-parameters-title" hidden>
               <div class="card-header">
-                <div>
-                  <h2 class="card-title" id="slicing-title">Slicing Parameters</h2>
-                  <p class="card-description">Silence detection, context padding, chunking, and overlap.</p>
+                <h2 class="card-title" id="refiner-parameters-title">Refiner Parameters</h2>
+              </div>
+              <div class="card-body card-body-refiner">
+                <div class="parameter-panel" id="shallow-diffusion-parameters" hidden>
+                  <label class="switch-row" for="second_encoding">
+                    <span class="switch-copy">
+                      <span class="switch-title">Second Encoding</span>
+                    </span>
+                    <span class="switch">
+                      <input id="second_encoding" name="second_encoding" type="checkbox" aria-label="Enable second encoding">
+                      <span class="switch-track" aria-hidden="true"></span>
+                    </span>
+                  </label>
+                  <div class="field-grid">
+                    <div class="field">
+                    <label for="diffusion_steps">Diffusion Steps</label>
+                    <input class="control" id="diffusion_steps" name="diffusion_steps" type="number" value="100" min="2" max="1000" step="1" required>
+                    <span class="field-hint">Schedule depth</span>
+                    </div>
+                    <div class="field">
+                    <label for="diffusion_speedup">Diffusion Speedup</label>
+                    <input class="control" id="diffusion_speedup" name="diffusion_speedup" type="number" value="10" min="1" max="50" step="1" required>
+                    <span class="field-hint">Steps ÷ speedup ≥ 2</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="parameter-panel parameter-panel-fields" id="flow-matching-parameters" hidden>
+                  <div class="field-grid">
+                  <div class="field">
+                    <label for="flow_matching_steps">Flow Matching Steps</label>
+                    <input class="control" id="flow_matching_steps" name="flow_matching_steps" type="number" value="50" min="1" step="1" required>
+                    <span class="field-hint">Euler ODE steps</span>
+                  </div>
+                  </div>
                 </div>
               </div>
-              <div class="card-body slice-fields" id="slice-fields">
+            </section>
+
+            <section class="card" id="slicing-parameters" aria-labelledby="slicing-title">
+              <div class="card-header">
+                <h2 class="card-title" id="slicing-title">Slicing Parameters</h2>
+              </div>
+              <div class="card-body">
                 <div class="field-grid">
                   <div class="field">
                     <label for="threshold_db">Silence Threshold</label>
-                    <input class="control slice-control" id="threshold_db" type="number" value="-40" max="0" step="0.1" required>
+                    <input class="control slice-control" id="threshold_db" name="threshold_db" type="number" value="-40" max="0" step="0.1" required>
                     <span class="field-hint">dB</span>
                   </div>
                   <div class="field">
                     <label for="padding_seconds">Context Padding</label>
-                    <input class="control slice-control" id="padding_seconds" type="number" value="0.5" min="0" step="0.05" required>
+                    <input class="control slice-control" id="padding_seconds" name="padding_seconds" type="number" value="0.5" min="0" step="0.05" required>
                     <span class="field-hint">Seconds per side</span>
                   </div>
                   <div class="field">
                     <label for="clip_seconds">Maximum Chunk</label>
-                    <input class="control slice-control" id="clip_seconds" type="number" value="0" min="0" step="0.1" required>
+                    <input class="control slice-control" id="clip_seconds" name="clip_seconds" type="number" value="0" min="0" step="0.1" required>
                     <span class="field-hint">0 disables splitting</span>
                   </div>
                   <div class="field">
                     <label for="crossfade_seconds">Chunk Overlap</label>
-                    <input class="control slice-control" id="crossfade_seconds" type="number" value="0" min="0" step="0.05" required>
+                    <input class="control slice-control" id="crossfade_seconds" name="crossfade_seconds" type="number" value="0" min="0" step="0.05" required>
                     <span class="field-hint">Seconds</span>
                   </div>
                   <div class="field">
                     <label for="crossfade_ratio">Crossfade Ratio</label>
-                    <input class="control slice-control" id="crossfade_ratio" type="number" value="0.75" min="0" max="1" step="0.05" required>
+                    <input class="control slice-control" id="crossfade_ratio" name="crossfade_ratio" type="number" value="0.75" min="0" max="1" step="0.05" required>
                     <span class="field-hint">0–1 overlap fraction</span>
                   </div>
                 </div>
@@ -1316,13 +1521,16 @@ const INDEX_HTML: &str = r##"<!doctype html>
         </div>
 
         <div class="action-bar">
-          <span class="action-copy" id="action-copy">Select one audio file to begin.</span>
-          <button class="primary-button" id="run-button" type="submit" disabled>Run Inference</button>
+          <span class="action-copy" id="action-copy" aria-live="polite">Choose an audio file, then run inference.</span>
+          <button class="primary-button" id="run-button" type="submit">
+            <span class="button-spinner" id="button-spinner" aria-hidden="true" hidden></span>
+            <span>Run Inference</span>
+          </button>
         </div>
 
-        <div class="message message-error" id="error-message" role="alert" aria-live="assertive"></div>
+        <div class="message message-error" id="error-message" role="alert" aria-live="assertive" tabindex="-1"></div>
 
-        <section class="card result" id="result" aria-labelledby="result-title">
+        <section class="card result" id="result" aria-labelledby="result-title" tabindex="-1">
           <div class="card-body">
             <div class="result-content">
               <div>
@@ -1348,12 +1556,17 @@ const INDEX_HTML: &str = r##"<!doctype html>
     const dropZone = byId("drop-zone");
     const fileInput = byId("audio-file");
     const fileSummary = byId("file-summary");
+    const fileError = byId("file-error");
     const runButton = byId("run-button");
+    const buttonSpinner = byId("button-spinner");
     const actionCopy = byId("action-copy");
     const errorMessage = byId("error-message");
     const slicing = byId("slicing");
-    const sliceFields = byId("slice-fields");
-    const shallowDiffusion = byId("shallow_diffusion");
+    const slicingParameters = byId("slicing-parameters");
+    const refinerInputs = Array.from(document.querySelectorAll('input[name="refiner"]'));
+    const refinerParameters = byId("refiner-parameters");
+    const shallowDiffusionParameters = byId("shallow-diffusion-parameters");
+    const flowMatchingParameters = byId("flow-matching-parameters");
     const pitchShift = byId("pitch_shift");
     const diffusionSteps = byId("diffusion_steps");
     const diffusionSpeedup = byId("diffusion_speedup");
@@ -1382,14 +1595,15 @@ const INDEX_HTML: &str = r##"<!doctype html>
       byId("file-name").textContent = file.name;
       byId("file-size").textContent = formatBytes(file.size);
       fileSummary.classList.add("is-visible");
-      runButton.disabled = false;
       actionCopy.textContent = "Ready to run local MLX inference.";
+      fileError.hidden = true;
       hideError();
     }
 
-    function showError(message) {
+    function showError(message, focusTarget = errorMessage) {
       errorMessage.textContent = message;
       errorMessage.classList.add("is-visible");
+      focusTarget.focus();
     }
 
     function hideError() {
@@ -1398,16 +1612,28 @@ const INDEX_HTML: &str = r##"<!doctype html>
     }
 
     function updateSlicingState() {
-      const disabled = !slicing.checked;
-      sliceFields.setAttribute("aria-disabled", String(disabled));
-      document.querySelectorAll(".slice-control").forEach((control) => {
-        control.disabled = disabled;
+      slicingParameters.hidden = !slicing.checked;
+      slicingParameters.querySelectorAll("input").forEach((control) => {
+        control.disabled = !slicing.checked;
       });
     }
 
-    function updateDiffusionState() {
-      document.querySelectorAll(".diffusion-control").forEach((control) => {
-        control.disabled = !shallowDiffusion.checked;
+    function selectedRefiner() {
+      return refinerInputs.find((input) => input.checked).value;
+    }
+
+    function updateRefinerState() {
+      const refiner = selectedRefiner();
+      const shallowDiffusion = refiner === "shallow_diffusion";
+      const flowMatching = refiner === "flow_matching";
+      refinerParameters.hidden = refiner === "none";
+      shallowDiffusionParameters.hidden = !shallowDiffusion;
+      flowMatchingParameters.hidden = !flowMatching;
+      shallowDiffusionParameters.querySelectorAll("input").forEach((control) => {
+        control.disabled = !shallowDiffusion;
+      });
+      flowMatchingParameters.querySelectorAll("input").forEach((control) => {
+        control.disabled = !flowMatching;
       });
     }
 
@@ -1429,13 +1655,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
       });
     }
 
-    dropZone.addEventListener("click", () => fileInput.click());
-    dropZone.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        fileInput.click();
+    async function waitForMinimumLoading(startedAt) {
+      const remaining = 400 - (performance.now() - startedAt);
+      if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remaining));
       }
-    });
+    }
+
+    dropZone.addEventListener("click", () => fileInput.click());
     fileInput.addEventListener("change", () => selectFile(fileInput.files[0]));
 
     ["dragenter", "dragover"].forEach((eventName) => {
@@ -1455,7 +1682,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     });
 
     slicing.addEventListener("change", updateSlicingState);
-    shallowDiffusion.addEventListener("change", updateDiffusionState);
+    refinerInputs.forEach((input) => input.addEventListener("change", updateRefinerState));
     pitchShift.addEventListener("input", updatePitchButtons);
     document.querySelectorAll("[data-pitch-value]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -1465,42 +1692,55 @@ const INDEX_HTML: &str = r##"<!doctype html>
     });
     diffusionSteps.addEventListener("input", updateSpeedupLimit);
     updateSlicingState();
-    updateDiffusionState();
+    updateRefinerState();
     updatePitchButtons();
     updateSpeedupLimit();
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (!selectedFile) {
-        showError("Missing input. Select one audio file before running inference.");
+        fileError.hidden = false;
+        dropZone.focus();
         return;
       }
       if (!form.reportValidity()) return;
 
+      const loadingStartedAt = performance.now();
+      const refiner = selectedRefiner();
       hideError();
       result.classList.remove("is-visible");
       runButton.disabled = true;
-      runButton.textContent = "Running Inference…";
-      actionCopy.textContent = "Processing locally. Keep this page open…";
+      runButton.setAttribute("aria-busy", "true");
+      buttonSpinner.hidden = false;
+      actionCopy.textContent = "Running inference locally…";
 
       const body = new FormData();
       body.append("audio", selectedFile, selectedFile.name);
       [
+        "input_gain",
         "pitch_shift",
         "noise_scale",
-        "diffusion_steps",
-        "diffusion_speedup",
-        "loudness_envelope_adjustment",
-        "threshold_db",
-        "padding_seconds",
-        "clip_seconds",
-        "crossfade_seconds",
-        "crossfade_ratio"
+        "loudness_envelope_adjustment"
       ].forEach((name) => body.append(name, byId(name).value));
       body.append("predict_f0", String(byId("predict_f0").checked));
-      body.append("shallow_diffusion", String(shallowDiffusion.checked));
-      body.append("second_encoding", String(byId("second_encoding").checked));
+      body.append("refiner", refiner);
       body.append("slicing", String(slicing.checked));
+      if (refiner === "shallow_diffusion") {
+        body.append("diffusion_steps", diffusionSteps.value);
+        body.append("diffusion_speedup", diffusionSpeedup.value);
+        body.append("second_encoding", String(byId("second_encoding").checked));
+      } else if (refiner === "flow_matching") {
+        body.append("flow_matching_steps", byId("flow_matching_steps").value);
+      }
+      if (slicing.checked) {
+        [
+          "threshold_db",
+          "padding_seconds",
+          "clip_seconds",
+          "crossfade_seconds",
+          "crossfade_ratio"
+        ].forEach((name) => body.append(name, byId(name).value));
+      }
 
       try {
         const response = await fetch("/api/infer", { method: "POST", body });
@@ -1508,6 +1748,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
           throw new Error(await response.text());
         }
         const blob = await response.blob();
+        await waitForMinimumLoading(loadingStartedAt);
         if (outputUrl) URL.revokeObjectURL(outputUrl);
         outputUrl = URL.createObjectURL(blob);
         const derivedOutputName = outputName(selectedFile.name);
@@ -1522,13 +1763,17 @@ const INDEX_HTML: &str = r##"<!doctype html>
           inferenceMilliseconds > 0 ? (inferenceMilliseconds / 1000).toFixed(2) + " s inference" : "";
         byId("result-size").textContent = formatBytes(blob.size);
         result.classList.add("is-visible");
+        result.focus();
         actionCopy.textContent = "Inference complete. Preview or download the result.";
       } catch (error) {
-        showError(error.message || "Inference failed. Review the parameters and try again.");
-        actionCopy.textContent = "Inference failed. Review the error below.";
+        await waitForMinimumLoading(loadingStartedAt);
+        const message = error.message || "Inference could not complete.";
+        showError(`${message} Review the audio format and parameters, then try again.`);
+        actionCopy.textContent = "Something went wrong. Review the guidance below.";
       } finally {
         runButton.disabled = false;
-        runButton.textContent = "Run Inference";
+        runButton.removeAttribute("aria-busy");
+        buttonSpinner.hidden = true;
       }
     });
   </script>

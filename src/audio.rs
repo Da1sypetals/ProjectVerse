@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use babycat::{Signal, Waveform, WaveformArgs};
+use babycat::{Signal, Waveform};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Conv1d, Upsample, UpsampleMode};
@@ -13,6 +13,8 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype, Stream};
 
+mod decode;
+
 #[derive(Debug)]
 pub struct Audio {
     pub samples: Array,
@@ -21,17 +23,8 @@ pub struct Audio {
 
 pub fn load_audio_first_channel(path: impl AsRef<Path>) -> Result<Audio> {
     let path = path.as_ref();
-    let filename = path
-        .to_str()
-        .with_context(|| format!("input audio path is not valid UTF-8: {}", path.display()))?;
-    let waveform = Waveform::from_file(
-        filename,
-        WaveformArgs {
-            num_channels: 1,
-            ..Default::default()
-        },
-    )
-    .with_context(|| format!("failed to decode input audio {}", path.display()))?;
+    let waveform = decode::from_file(path)
+        .with_context(|| format!("failed to decode input audio {}", path.display()))?;
     waveform_to_audio(waveform, &path.display().to_string())
 }
 
@@ -40,16 +33,8 @@ pub fn load_audio_bytes_first_channel(
     file_extension: &str,
     mime_type: &str,
 ) -> Result<Audio> {
-    let waveform = Waveform::from_encoded_bytes_with_hint(
-        bytes,
-        WaveformArgs {
-            num_channels: 1,
-            ..Default::default()
-        },
-        file_extension,
-        mime_type,
-    )
-    .context("failed to decode uploaded audio")?;
+    let waveform = decode::from_bytes(bytes, file_extension, mime_type)
+        .context("failed to decode uploaded audio")?;
     waveform_to_audio(waveform, "uploaded audio")
 }
 

@@ -1,13 +1,13 @@
 mod attention;
 pub mod audio;
 pub mod contentvec;
-pub mod diffusion;
 mod f0_decoder;
 mod flow;
 pub mod gan;
 mod gan_generator;
 pub mod inference;
 pub mod pitch;
+pub mod refine;
 pub mod slicer;
 pub mod vocoder;
 pub mod weights;

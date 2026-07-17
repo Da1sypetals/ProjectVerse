@@ -9,12 +9,11 @@ use mlx_rs::random::normal;
 
 use crate::audio::{SincResampler, VolumeExtractor, adjust_loudness_envelope};
 use crate::contentvec::ContentVec;
-use crate::diffusion::DiffusionModel;
 use crate::gan::GanModel;
 use crate::pitch::FcpePredictor;
+use crate::refine::{FlowMatchingRefiner, ShallowDiffusionRefiner};
 use crate::slicer::Slicer;
 use crate::vocoder::NsfHifiGan;
-use crate::weights::Weights;
 
 const SAMPLE_RATE: i32 = 44_100;
 const ENCODER_SAMPLE_RATE: i32 = 16_000;
@@ -22,29 +21,48 @@ const HOP_SIZE: i32 = 512;
 
 #[derive(Debug, Clone)]
 pub struct InferenceOptions {
+    pub input_gain_db: i32,
     pub pitch_shift: f32,
     pub noise_scale: f32,
     pub predict_f0: bool,
-    pub shallow_diffusion: bool,
+    pub refiner: Refiner,
     pub diffusion_steps: i32,
     pub diffusion_speedup: i32,
+    pub flow_matching_steps: i32,
     pub loudness_envelope_adjustment: f32,
     pub second_encoding: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refiner {
+    None,
+    ShallowDiffusion,
+    FlowMatching,
 }
 
 impl Default for InferenceOptions {
     fn default() -> Self {
         Self {
+            input_gain_db: 0,
             pitch_shift: 0.0,
             noise_scale: 0.4,
             predict_f0: false,
-            shallow_diffusion: false,
+            refiner: Refiner::None,
             diffusion_steps: 100,
             diffusion_speedup: 10,
+            flow_matching_steps: 50,
             loudness_envelope_adjustment: 1.0,
             second_encoding: false,
         }
     }
+}
+
+fn input_gain_factor(input_gain_db: i32) -> Result<f32> {
+    ensure!(
+        (-12..=12).contains(&input_gain_db),
+        "input gain must be between -12 and 12 dB"
+    );
+    Ok(10.0_f64.powf(input_gain_db as f64 / 20.0_f64) as f32)
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +102,8 @@ pub struct SovitsSvc {
     contentvec: ContentVec,
     pitch: FcpePredictor,
     gan: GanModel,
-    diffusion: DiffusionModel,
+    shallow_diffusion: ShallowDiffusionRefiner,
+    flow_matching: FlowMatchingRefiner,
     vocoder: NsfHifiGan,
     volume: VolumeExtractor,
     encoder_resampler: SincResampler,
@@ -94,7 +113,8 @@ pub struct SovitsSvc {
 impl SovitsSvc {
     pub fn load(
         gan_checkpoint: impl AsRef<Path>,
-        diffusion_checkpoint: impl AsRef<Path>,
+        shallow_diffusion_checkpoint: impl AsRef<Path>,
+        flow_matching_checkpoint: impl AsRef<Path>,
         contentvec_checkpoint: impl AsRef<Path>,
         fcpe_checkpoint: impl AsRef<Path>,
         vocoder_checkpoint: impl AsRef<Path>,
@@ -103,7 +123,8 @@ impl SovitsSvc {
             contentvec: ContentVec::load(contentvec_checkpoint)?,
             pitch: FcpePredictor::load(fcpe_checkpoint),
             gan: GanModel::load(gan_checkpoint)?,
-            diffusion: DiffusionModel::load(Weights::load(diffusion_checkpoint)?)?,
+            shallow_diffusion: ShallowDiffusionRefiner::load(shallow_diffusion_checkpoint)?,
+            flow_matching: FlowMatchingRefiner::load(flow_matching_checkpoint)?,
             vocoder: NsfHifiGan::load(vocoder_checkpoint)?,
             volume: VolumeExtractor::new(HOP_SIZE)?,
             encoder_resampler: SincResampler::new(SAMPLE_RATE, ENCODER_SAMPLE_RATE, 6)?,
@@ -139,11 +160,22 @@ impl SovitsSvc {
             "input audio must have shape [1, samples]"
         );
         ensure!(sample_rate > 0, "input sample rate must be positive");
+        let input_gain = input_gain_factor(options.input_gain_db)?;
+        let audio = audio * input_gain;
+        self.infer_after_input_gain(&audio, sample_rate, options)
+    }
+
+    fn infer_after_input_gain(
+        &mut self,
+        audio: &Array,
+        sample_rate: i32,
+        options: &InferenceOptions,
+    ) -> Result<InferenceOutput> {
         ensure!(
             options.noise_scale >= 0.0,
             "GAN noise scale must be non-negative"
         );
-        if options.shallow_diffusion {
+        if options.refiner == Refiner::ShallowDiffusion {
             ensure!(
                 options.diffusion_steps >= 2,
                 "diffusion step count must be at least 2"
@@ -151,6 +183,12 @@ impl SovitsSvc {
             ensure!(
                 options.diffusion_speedup > 0,
                 "diffusion speedup must be positive"
+            );
+        }
+        if options.refiner == Refiner::FlowMatching {
+            ensure!(
+                options.flow_matching_steps >= 1,
+                "flow matching step count must be positive"
             );
         }
         let resampled_audio = self.resample_input(audio, sample_rate)?;
@@ -186,40 +224,51 @@ impl SovitsSvc {
         )?;
         gan.audio.eval()?;
 
-        let (output, refined_mel, diffusion_content) = if options.shallow_diffusion {
+        let (output, refined_mel, diffusion_content) = if options.refiner != Refiner::None {
             let gan_waveform = gan.audio.squeeze_axes(&[-1])?;
             let initial_mel = self.vocoder.mel.extract(&gan_waveform)?;
             let f0 = gan.f0.expand_dims(-1)?;
             let volume_condition = volume.expand_dims(-1)?;
-            let diffusion_content = if options.second_encoding {
-                let wav_16k = self.encoder_resampler.resample(&gan_waveform)?;
-                let encoded = self.contentvec.encode(&wav_16k)?;
-                ContentVec::expand_nearest(&encoded, gan.f0.shape()[1])?
-            } else {
-                content.clone()
+            let diffusion_content =
+                if options.refiner == Refiner::ShallowDiffusion && options.second_encoding {
+                    let wav_16k = self.encoder_resampler.resample(&gan_waveform)?;
+                    let encoded = self.contentvec.encode(&wav_16k)?;
+                    ContentVec::expand_nearest(&encoded, gan.f0.shape()[1])?
+                } else {
+                    content.clone()
+                };
+            let refined_mel = match options.refiner {
+                Refiner::ShallowDiffusion => {
+                    let noise = normal::<f32>(
+                        &[
+                            initial_mel.shape()[0],
+                            1,
+                            initial_mel.shape()[2],
+                            initial_mel.shape()[1],
+                        ],
+                        None,
+                        None,
+                        None,
+                    )?;
+                    self.shallow_diffusion.refine(
+                        &diffusion_content,
+                        &f0,
+                        &volume_condition,
+                        &initial_mel,
+                        &noise,
+                        options.diffusion_steps,
+                        options.diffusion_speedup,
+                    )?
+                }
+                Refiner::FlowMatching => self.flow_matching.refine(
+                    &diffusion_content,
+                    &f0,
+                    &volume_condition,
+                    &initial_mel,
+                    options.flow_matching_steps,
+                )?,
+                Refiner::None => unreachable!("refiner branch excludes none"),
             };
-            let condition = self
-                .diffusion
-                .condition(&diffusion_content, &f0, &volume_condition)?;
-            let normalized = self
-                .diffusion
-                .norm_spec(&initial_mel)?
-                .swap_axes(1, 2)?
-                .expand_dims(1)?;
-            let diffusion_noise = normal::<f32>(normalized.shape(), None, None, None)?;
-            let timestep = Array::from_int(options.diffusion_steps - 1).reshape(&[1])?;
-            let noisy = self
-                .diffusion
-                .q_sample(&normalized, &timestep, &diffusion_noise)?;
-            let refined = self.diffusion.sample_dpm_solver_pp(
-                &noisy,
-                &condition,
-                options.diffusion_steps,
-                options.diffusion_speedup,
-            )?;
-            let refined_mel = self
-                .diffusion
-                .denorm_spec(&refined.squeeze_axes(&[1])?.swap_axes(1, 2)?)?;
             let vocoder_f0 = gan.f0.index((.., ..refined_mel.shape()[1]));
             let output = self.vocoder.infer(&refined_mel, &vocoder_f0)?;
             (output, Some(refined_mel), Some(diffusion_content))
@@ -273,7 +322,9 @@ impl SovitsSvc {
             (0.0..=1.0).contains(&slice_options.crossfade_ratio),
             "crossfade ratio must be between zero and one"
         );
-        let slices = Slicer::standard(sample_rate, slice_options.threshold_db)?.slice(audio)?;
+        let input_gain = input_gain_factor(inference_options.input_gain_db)?;
+        let audio = audio * input_gain;
+        let slices = Slicer::standard(sample_rate, slice_options.threshold_db)?.slice(&audio)?;
         let clip_size = (slice_options.clip_seconds * sample_rate as f32) as i32;
         let overlap_size = (slice_options.crossfade_seconds * sample_rate as f32) as i32;
         ensure!(
@@ -340,12 +391,12 @@ impl SovitsSvc {
                     None,
                 )?;
                 let inferred = self
-                    .infer(&source, sample_rate, inference_options)?
+                    .infer_after_input_gain(&source, sample_rate, inference_options)?
                     .audio
                     .reshape(&[1, -1])?;
                 let target_padding = (SAMPLE_RATE as f32 * slice_options.padding_seconds) as i32;
                 let inferred = if target_padding == 0 {
-                    inferred.index((.., 0..0))
+                    inferred
                 } else {
                     ensure!(
                         inferred.shape()[1] >= target_padding * 2,
@@ -412,5 +463,19 @@ impl SovitsSvc {
             }
         }
         accumulated.ok_or_else(|| anyhow::anyhow!("slicer produced no output"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_gain_uses_decibels_and_enforces_integer_range() {
+        assert_eq!(input_gain_factor(0).unwrap(), 1.0);
+        assert!((input_gain_factor(12).unwrap() - 3.981_071_7).abs() < 1.0e-6);
+        assert!((input_gain_factor(-12).unwrap() - 0.251_188_64).abs() < 1.0e-7);
+        assert!(input_gain_factor(-13).is_err());
+        assert!(input_gain_factor(13).is_err());
     }
 }

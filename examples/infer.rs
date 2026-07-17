@@ -4,28 +4,65 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use sovits_svc_mlx::audio::{load_audio_first_channel, write_wav_float};
-use sovits_svc_mlx::inference::{InferenceOptions, SliceInferenceOptions, SovitsSvc};
+use sovits_svc_mlx::inference::{InferenceOptions, Refiner, SliceInferenceOptions, SovitsSvc};
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Run so-vits-svc GAN and shallow-diffusion inference with MLX"
+    about = "Run so-vits-svc GAN inference with optional MLX refiners"
 )]
 struct Arguments {
     /// Input audio file supported by Babycat, sampled at 44.1 or 48 kHz.
     input: PathBuf,
 
-    /// Directory containing the converted GAN, diffusion, ContentVec, and vocoder weights.
-    #[arg(long, default_value = "artifacts")]
-    artifact_dir: PathBuf,
+    /// Converted GAN checkpoint.
+    #[arg(long, default_value = "../ckpt/mlx/gan/e83_s2400/model.safetensors")]
+    gan_checkpoint: PathBuf,
+
+    /// Converted shallow-diffusion checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/refine/shallow_diffusion/guan/model.safetensors"
+    )]
+    shallow_diffusion_checkpoint: PathBuf,
+
+    /// Converted Flow Matching checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/refine/flow_matching/opencpop/model.safetensors"
+    )]
+    flow_matching_checkpoint: PathBuf,
+
+    /// Converted ContentVec checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/encoder/contentvec/model.safetensors"
+    )]
+    contentvec_checkpoint: PathBuf,
 
     /// FCPE MLX safetensors checkpoint.
-    #[arg(long, default_value = "../ckpt/fcpe.safetensors")]
+    #[arg(long, default_value = "../ckpt/mlx/pitch/fcpe/model.safetensors")]
     fcpe_checkpoint: PathBuf,
+
+    /// Converted NSF-HiFiGAN checkpoint.
+    #[arg(
+        long,
+        default_value = "../ckpt/mlx/vocoder/nsf_hifigan/model.safetensors"
+    )]
+    vocoder_checkpoint: PathBuf,
 
     /// Pitch shift in semitones.
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     pitch_shift: f32,
+
+    /// Input gain in dB.
+    #[arg(
+        long = "input-gain",
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i32).range(-12..=12)
+    )]
+    input_gain_db: i32,
 
     /// GAN latent noise scale.
     #[arg(long, default_value_t = 0.4)]
@@ -36,8 +73,12 @@ struct Arguments {
     predict_f0: bool,
 
     /// Refine the GAN output with shallow diffusion.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "flow_matching")]
     shallow_diffusion: bool,
+
+    /// Refine the GAN output with Flow Matching.
+    #[arg(long, conflicts_with = "shallow_diffusion")]
+    flow_matching: bool,
 
     /// Number of shallow-diffusion steps from the training schedule.
     #[arg(long, default_value_t = 100)]
@@ -46,6 +87,10 @@ struct Arguments {
     /// DPM-Solver++ inference speedup divisor.
     #[arg(long, default_value_t = 10)]
     diffusion_speedup: i32,
+
+    /// Number of Flow Matching Euler integration steps.
+    #[arg(long, default_value_t = 50)]
+    flow_matching_steps: i32,
 
     /// Output loudness-envelope adjustment strength.
     #[arg(long, default_value_t = 1.0)]
@@ -98,19 +143,29 @@ fn main() -> Result<()> {
     let output_path = output_path(&arguments.input)?;
     let input = load_audio_first_channel(&arguments.input)?;
     let mut model = SovitsSvc::load(
-        arguments.artifact_dir.join("gan.safetensors"),
-        arguments.artifact_dir.join("diffusion.safetensors"),
-        arguments.artifact_dir.join("contentvec.safetensors"),
+        &arguments.gan_checkpoint,
+        &arguments.shallow_diffusion_checkpoint,
+        &arguments.flow_matching_checkpoint,
+        &arguments.contentvec_checkpoint,
         &arguments.fcpe_checkpoint,
-        arguments.artifact_dir.join("vocoder.safetensors"),
+        &arguments.vocoder_checkpoint,
     )?;
+    let refiner = if arguments.shallow_diffusion {
+        Refiner::ShallowDiffusion
+    } else if arguments.flow_matching {
+        Refiner::FlowMatching
+    } else {
+        Refiner::None
+    };
     let inference_options = InferenceOptions {
+        input_gain_db: arguments.input_gain_db,
         pitch_shift: arguments.pitch_shift,
         noise_scale: arguments.noise_scale,
         predict_f0: arguments.predict_f0,
-        shallow_diffusion: arguments.shallow_diffusion,
+        refiner,
         diffusion_steps: arguments.diffusion_steps,
         diffusion_speedup: arguments.diffusion_speedup,
+        flow_matching_steps: arguments.flow_matching_steps,
         loudness_envelope_adjustment: arguments.loudness_envelope_adjustment,
         second_encoding: arguments.second_encoding,
     };
@@ -164,7 +219,13 @@ mod tests {
     fn defaults_enable_slicing_and_derive_output_path() {
         let arguments = Arguments::try_parse_from(["infer", "voice.demo.flac"]).unwrap();
         assert!(arguments.slicing);
+        assert_eq!(arguments.input_gain_db, 0);
         assert!(!arguments.shallow_diffusion);
+        assert!(!arguments.flow_matching);
+        assert_eq!(
+            arguments.gan_checkpoint,
+            PathBuf::from("../ckpt/mlx/gan/e83_s2400/model.safetensors")
+        );
         assert_eq!(
             output_path(&arguments.input).unwrap(),
             PathBuf::from("voice.demo-converted.wav")
@@ -178,9 +239,25 @@ mod tests {
     }
 
     #[test]
+    fn input_gain_accepts_only_integer_values_in_range() {
+        assert!(Arguments::try_parse_from(["infer", "voice.wav", "--input-gain", "-12"]).is_ok());
+        assert!(Arguments::try_parse_from(["infer", "voice.wav", "--input-gain", "12"]).is_ok());
+        assert!(Arguments::try_parse_from(["infer", "voice.wav", "--input-gain", "-13"]).is_err());
+        assert!(Arguments::try_parse_from(["infer", "voice.wav", "--input-gain", "13"]).is_err());
+        assert!(Arguments::try_parse_from(["infer", "voice.wav", "--input-gain", "1.5"]).is_err());
+    }
+
+    #[test]
     fn shallow_diffusion_flag_enables_diffusion() {
         let arguments =
             Arguments::try_parse_from(["infer", "voice.wav", "--shallow-diffusion"]).unwrap();
         assert!(arguments.shallow_diffusion);
+    }
+
+    #[test]
+    fn flow_matching_flag_enables_flow_matching() {
+        let arguments =
+            Arguments::try_parse_from(["infer", "voice.wav", "--flow-matching"]).unwrap();
+        assert!(arguments.flow_matching);
     }
 }

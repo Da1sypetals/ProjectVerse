@@ -4,7 +4,7 @@ from pathlib import Path
 
 import librosa
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 
 def fuse_weight_norm(state):
@@ -58,6 +58,7 @@ def save_checkpoint(source, destination, state_key, transpose_convs, cast_float3
         }
     state = fuse_weight_norm(state)
     state = convert_layout(state, transpose_convs)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     save_file(state, destination)
     return {
         "source": str(source.resolve()),
@@ -85,6 +86,7 @@ def save_vocoder_checkpoint(source, config_source, destination):
         )
     ).transpose(0, 1).contiguous()
     state["_buffers.hann_window"] = torch.hann_window(config["win_size"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
     save_file(state, destination)
     return {
         "source": str(source.resolve()),
@@ -116,6 +118,7 @@ def save_reference(source, tensor_destination, metadata_destination):
     scalars = {}
     flatten_reference(reference, "", tensors, scalars)
     assert tensors, f"{source} contains no tensors"
+    tensor_destination.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, tensor_destination)
     metadata_destination.write_text(
         json.dumps(scalars, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -129,70 +132,133 @@ def save_reference(source, tensor_destination, metadata_destination):
     }
 
 
+def save_flow_matching_checkpoint(source, destination):
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    assert "model" in checkpoint, f"{source} has no 'model' state"
+    source_state = checkpoint["model"]
+    assert isinstance(source_state, dict) and source_state, f"{source} contains an empty model state"
+    state = {}
+    for name, tensor in source_state.items():
+        if name.startswith("unit2mel."):
+            state[name.removeprefix("unit2mel.")] = tensor
+        elif name in {"a_k", "b_k", "t_k"}:
+            state[name] = tensor
+        else:
+            raise AssertionError(f"unexpected Flow Matching tensor: {name}")
+    state["_flow.alphas_cumprod_ascending"] = source_state[
+        "unit2mel.decoder.alphas_cumprod"
+    ].flip(0)
+    state["_flow.timesteps"] = torch.tensor(checkpoint["config"]["timesteps"], dtype=torch.int32)
+    state["_flow.t_eps"] = torch.tensor(checkpoint["config"]["t_eps"], dtype=torch.float32)
+    state["_flow.default_ode_steps"] = torch.tensor(
+        checkpoint["config"]["ode_steps"],
+        dtype=torch.int32,
+    )
+    state = fuse_weight_norm(state)
+    state = convert_layout(state, ())
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_file(state, destination)
+    return {
+        "source": str(source.resolve()),
+        "destination": str(destination.resolve()),
+        "tensor_count": len(state),
+        "parameters": sum(tensor.numel() for tensor in state.values()),
+        "global_step": checkpoint["global_step"],
+        "epoch": checkpoint["epoch"],
+        "config": checkpoint["config"],
+    }
+
+
+def save_existing_safetensors(source, destination):
+    state = load_file(source)
+    assert state, f"{source} contains no tensors"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_file(state, destination)
+    return {
+        "source": str(source.resolve()),
+        "destination": str(destination.resolve()),
+        "tensor_count": len(state),
+        "parameters": sum(tensor.numel() for tensor in state.values()),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gan", type=Path, required=True)
-    parser.add_argument("--diffusion", type=Path, required=True)
+    parser.add_argument("--gan", nargs=2, action="append", metavar=("NAME", "PATH"), required=True)
+    parser.add_argument("--shallow-diffusion", type=Path, required=True)
+    parser.add_argument("--flow-matching", type=Path, required=True)
     parser.add_argument("--contentvec", type=Path, required=True)
+    parser.add_argument("--fcpe", type=Path, required=True)
     parser.add_argument("--vocoder", type=Path, required=True)
     parser.add_argument("--vocoder-config", type=Path, required=True)
-    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument(
+        "--reference",
+        nargs=2,
+        action="append",
+        metavar=("NAME", "PATH"),
+        default=[],
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    assert args.gan.is_file(), args.gan
-    assert args.diffusion.is_file(), args.diffusion
+    for name, path in args.gan:
+        path = Path(path)
+        assert name, "GAN name cannot be empty"
+        assert path.is_file(), path
+    assert args.shallow_diffusion.is_file(), args.shallow_diffusion
+    assert args.flow_matching.is_file(), args.flow_matching
     assert args.contentvec.is_file(), args.contentvec
+    assert args.fcpe.is_file(), args.fcpe
     assert args.vocoder.is_file(), args.vocoder
     assert args.vocoder_config.is_file(), args.vocoder_config
-    assert args.reference.is_file(), args.reference
+    for name, path in args.reference:
+        path = Path(path)
+        assert name, "reference name cannot be empty"
+        assert path.is_file(), path
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = {
-        "format": "sovits-svc-mlx-v1",
-        "layout": {
-            "activation": "channels_last",
-            "conv1d_weight": "out_kernel_in",
-            "conv_transpose1d_weight": "out_kernel_in",
-            "linear_weight": "out_in",
-        },
-        "gan": save_checkpoint(
-            args.gan,
-            args.output_dir / "gan.safetensors",
+    for name, path in args.gan:
+        save_checkpoint(
+            Path(path),
+            args.output_dir / "gan" / name / "model.safetensors",
             "model",
             ("dec.ups.",),
-        ),
-        "diffusion": save_checkpoint(
-            args.diffusion,
-            args.output_dir / "diffusion.safetensors",
-            "model",
-            (),
-        ),
-        "contentvec": save_checkpoint(
-            args.contentvec,
-            args.output_dir / "contentvec.safetensors",
-            "model",
-            (),
-            cast_float32=True,
-        ),
-        "vocoder": save_vocoder_checkpoint(
-            args.vocoder,
-            args.vocoder_config,
-            args.output_dir / "vocoder.safetensors",
-        ),
-        "reference": save_reference(
-            args.reference,
-            args.output_dir / "reference.safetensors",
-            args.output_dir / "reference.json",
-        ),
-    }
-    (args.output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+        )
+    save_checkpoint(
+        args.shallow_diffusion,
+        args.output_dir / "refine" / "shallow_diffusion" / "guan" / "model.safetensors",
+        "model",
+        (),
     )
+    save_flow_matching_checkpoint(
+        args.flow_matching,
+        args.output_dir / "refine" / "flow_matching" / "opencpop" / "model.safetensors",
+    )
+    save_checkpoint(
+        args.contentvec,
+        args.output_dir / "encoder" / "contentvec" / "model.safetensors",
+        "model",
+        (),
+        cast_float32=True,
+    )
+    save_existing_safetensors(
+        args.fcpe,
+        args.output_dir / "pitch" / "fcpe" / "model.safetensors",
+    )
+    save_vocoder_checkpoint(
+        args.vocoder,
+        args.vocoder_config,
+        args.output_dir / "vocoder" / "nsf_hifigan" / "model.safetensors",
+    )
+    for name, path in args.reference:
+        save_reference(
+            Path(path),
+            args.output_dir / "references" / name / "tensors.safetensors",
+            args.output_dir / "references" / name / "metadata.json",
+        )
 
 
 if __name__ == "__main__":
