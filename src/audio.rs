@@ -4,11 +4,11 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use mlx_rs::module::Module;
-use mlx_rs::nn::{Conv1d, Upsample, UpsampleMode};
+use mlx_rs::nn::Conv1d;
 use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::ops::{
-    as_strided, clip_device, concatenate_axis, maximum, mean_axis, pad, power, sqrt, square,
-    r#where_device,
+    as_strided, broadcast_to, ceil, clip, clip_device, concatenate_axis, floor, maximum, mean_axis,
+    pad, power, sqrt, square, r#where_device,
 };
 use mlx_rs::{Array, Dtype, Stream};
 
@@ -94,6 +94,38 @@ fn centered_rms(audio: &Array, frame_length: i32, hop_length: i32) -> Result<Arr
     Ok(sqrt(&mean_axis(&square(&frames)?, -1, false)?)?)
 }
 
+fn interpolate_linear_1d_to_length(input: &Array, target_length: i32) -> Result<Array> {
+    ensure!(input.ndim() == 2, "linear interpolation input must be 2D");
+    ensure!(input.shape()[1] > 0, "linear interpolation input is empty");
+    ensure!(target_length > 0, "linear interpolation target is empty");
+
+    let input_length = input.shape()[1];
+    if input_length == target_length {
+        return Ok(input.clone());
+    }
+    if input_length == 1 {
+        return Ok(broadcast_to(input, &[input.shape()[0], target_length])?);
+    }
+
+    let step = input_length as f32 / target_length as f32;
+    let start = (1.0_f32 - step) / 2.0_f32;
+    let positions = Array::arange::<_, f32>(Some(0), target_length, None)? * step - start;
+    let positions = clip(&positions, (0, input_length - 1))?;
+    let left_positions = floor(&positions)?;
+    let right_positions = ceil(&positions)?;
+    let weights = &positions - &left_positions;
+    let left_indices = left_positions.as_type::<i32>()?;
+    let right_indices = right_positions.as_type::<i32>()?;
+    let left_values = input.take_axis(&left_indices, 1)?;
+    let right_values = input.take_axis(&right_indices, 1)?;
+    let interpolated = left_values * (Array::from_f32(1.0) - &weights) + right_values * weights;
+    ensure!(
+        interpolated.shape() == [input.shape()[0], target_length],
+        "linear interpolation produced an incorrect shape"
+    );
+    Ok(interpolated)
+}
+
 pub fn adjust_loudness_envelope(
     source: &Array,
     source_sample_rate: i32,
@@ -118,28 +150,8 @@ pub fn adjust_loudness_envelope(
     let source_rms = centered_rms(source, source_sample_rate / 2 * 2, source_sample_rate / 2)?;
     let output_rms = centered_rms(&output, output_sample_rate / 2 * 2, output_sample_rate / 2)?;
     let target_length = output.shape()[1];
-    let mut source_interpolator = Upsample::new(
-        target_length as f32 / source_rms.shape()[1] as f32,
-        UpsampleMode::Linear {
-            align_corners: false,
-        },
-    );
-    let mut output_interpolator = Upsample::new(
-        target_length as f32 / output_rms.shape()[1] as f32,
-        UpsampleMode::Linear {
-            align_corners: false,
-        },
-    );
-    let source_rms = source_interpolator
-        .forward(&source_rms.expand_dims(-1)?)?
-        .reshape(&[1, -1])?;
-    let output_rms = output_interpolator
-        .forward(&output_rms.expand_dims(-1)?)?
-        .reshape(&[1, -1])?;
-    ensure!(
-        source_rms.shape()[1] == target_length && output_rms.shape()[1] == target_length,
-        "RMS interpolation produced an incorrect sample count"
-    );
+    let source_rms = interpolate_linear_1d_to_length(&source_rms, target_length)?;
+    let output_rms = interpolate_linear_1d_to_length(&output_rms, target_length)?;
     let output_rms = maximum(&output_rms, &Array::from_f32(1.0e-6))?;
     let source_gain = power(&source_rms, &Array::from_f32(1.0 - output_rate))?;
     let output_gain = power(&output_rms, &Array::from_f32(output_rate - 1.0))?;
@@ -330,5 +342,41 @@ impl VolumeExtractor {
             0,
         )?;
         Ok(sqrt(&mean_axis(&windows, -1, false)?)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::interpolate_linear_1d_to_length;
+    use mlx_rs::Array;
+
+    #[test]
+    fn linear_interpolation_uses_exact_requested_length() -> Result<()> {
+        let input = Array::from_slice(&[0.0_f32, 10.0, 20.0], &[1, 3]);
+        let output = interpolate_linear_1d_to_length(&input, 5)?;
+        output.eval()?;
+
+        assert_eq!(output.shape(), &[1, 5]);
+        assert_eq!(
+            output.as_slice::<f32>(),
+            &[0.0, 4.000_000_5, 10.0, 16.000_002, 20.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn linear_interpolation_matches_pytorch_half_pixel_coordinates() -> Result<()> {
+        let input = Array::from_slice(&[0.0_f32, 10.0, 20.0, 30.0], &[1, 4]);
+        let output = interpolate_linear_1d_to_length(&input, 2)?;
+        output.eval()?;
+        assert_eq!(output.as_slice::<f32>(), &[5.0, 25.0]);
+
+        let single = Array::from_slice(&[3.25_f32], &[1, 1]);
+        let broadcast = interpolate_linear_1d_to_length(&single, 4)?;
+        let broadcast_sum = mlx_rs::ops::sum(&broadcast, false)?;
+        assert_eq!(broadcast_sum.item::<f32>(), 13.0);
+        Ok(())
     }
 }

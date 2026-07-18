@@ -104,7 +104,9 @@ struct WebParameters {
 impl Default for WebParameters {
     fn default() -> Self {
         let mut inference = InferenceOptions::default();
-        inference.loudness_envelope_adjustment = 0.0;
+        inference.input_gain_db = -2;
+        inference.pitch_shift = 12.0;
+        inference.loudness_envelope_adjustment = 1.0;
         Self {
             inference,
             slicing: true,
@@ -524,17 +526,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_defaults_match_reference_interfaces() {
+    fn web_defaults_match_interface() {
         let parameters = WebParameters::default();
-        assert_eq!(parameters.inference.input_gain_db, 0);
-        assert_eq!(parameters.inference.pitch_shift, 0.0);
+        assert_eq!(parameters.inference.input_gain_db, -2);
+        assert_eq!(parameters.inference.pitch_shift, 12.0);
         assert_eq!(parameters.inference.noise_scale, 0.4);
         assert!(!parameters.inference.predict_f0);
         assert_eq!(parameters.inference.refiner, Refiner::None);
         assert_eq!(parameters.inference.diffusion_steps, 100);
         assert_eq!(parameters.inference.diffusion_speedup, 10);
         assert_eq!(parameters.inference.flow_matching_steps, 50);
-        assert_eq!(parameters.inference.loudness_envelope_adjustment, 0.0);
+        assert_eq!(parameters.inference.loudness_envelope_adjustment, 1.0);
         assert!(!parameters.inference.second_encoding);
         assert!(parameters.slicing);
         assert_eq!(parameters.slice.threshold_db, -40.0);
@@ -591,7 +593,13 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="flow-matching-parameters" hidden"#));
         assert!(INDEX_HTML.contains(r#"id="slicing-parameters""#));
         assert!(INDEX_HTML.contains(
-            r#"<input class="control" id="input_gain" name="input_gain" type="number" value="0" min="-12" max="12" step="1" required>"#
+            r#"<input class="control" id="input_gain" name="input_gain" type="number" value="-2" min="-12" max="12" step="1" required>"#
+        ));
+        assert!(INDEX_HTML.contains(
+            r#"<input class="control" id="pitch_shift" name="pitch_shift" type="number" value="12" min="-48" max="48" step="1" required>"#
+        ));
+        assert!(INDEX_HTML.contains(
+            r#"<input class="control" id="loudness_envelope_adjustment" name="loudness_envelope_adjustment" type="number" value="1" min="0" max="1" step="0.05" required>"#
         ));
         assert!(!INDEX_HTML.contains("<select"));
         assert!(!INDEX_HTML.contains("shallow-diffusion-control"));
@@ -601,6 +609,8 @@ mod tests {
         assert!(!INDEX_HTML.contains("Engine Ready"));
         assert!(!INDEX_HTML.contains("Local Voice Conversion"));
         assert!(!INDEX_HTML.contains("Babycat-supported"));
+        assert!(INDEX_HTML.contains("Higher adds more variation"));
+        assert!(INDEX_HTML.contains("0 source · 1 output"));
     }
 }
 
@@ -1417,14 +1427,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
                 <div class="field-grid field-grid-two">
                   <div class="field">
                     <label for="input_gain">Input Gain</label>
-                    <input class="control" id="input_gain" name="input_gain" type="number" value="0" min="-12" max="12" step="1" required>
+                    <input class="control" id="input_gain" name="input_gain" type="number" value="-2" min="-12" max="12" step="1" required>
                     <span class="field-hint">dB</span>
                   </div>
                   <div class="field">
                     <label for="pitch_shift">Pitch Shift</label>
                     <div class="pitch-control">
                       <button class="pitch-button" type="button" data-pitch-value="-12" aria-pressed="false">−12</button>
-                      <input class="control" id="pitch_shift" name="pitch_shift" type="number" value="0" min="-48" max="48" step="1" required>
+                      <input class="control" id="pitch_shift" name="pitch_shift" type="number" value="12" min="-48" max="48" step="1" required>
                       <button class="pitch-button" type="button" data-pitch-value="12" aria-pressed="false">+12</button>
                     </div>
                     <span class="field-hint">Semitones</span>
@@ -1432,12 +1442,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
                   <div class="field">
                     <label for="noise_scale">GAN Noise Scale</label>
                     <input class="control" id="noise_scale" name="noise_scale" type="number" value="0.4" min="0" step="0.01" required>
-                    <span class="field-hint">Non-negative</span>
+                    <span class="field-hint">Higher adds more variation</span>
                   </div>
                   <div class="field">
                     <label for="loudness_envelope_adjustment">Loudness Envelope</label>
-                    <input class="control" id="loudness_envelope_adjustment" name="loudness_envelope_adjustment" type="number" value="0" min="0" max="1" step="0.05" required>
-                    <span class="field-hint">0–1 strength</span>
+                    <input class="control" id="loudness_envelope_adjustment" name="loudness_envelope_adjustment" type="number" value="1" min="0" max="1" step="0.05" required>
+                    <span class="field-hint">0 source · 1 output</span>
                   </div>
                 </div>
               </div>
