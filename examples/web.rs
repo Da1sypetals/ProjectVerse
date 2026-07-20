@@ -26,7 +26,7 @@ const OUTPUT_SAMPLE_RATE: u32 = 44_100;
 #[command(version, about = "Serve the local so-vits-svc MLX inference interface")]
 struct Arguments {
     /// Converted GAN checkpoint.
-    #[arg(long, default_value = "../ckpt/mlx/gan/opencpop/model.safetensors")]
+    #[arg(long, default_value = "../ckpt/mlx/gan/guan/model.safetensors")]
     gan_checkpoint: PathBuf,
 
     /// Converted shallow-diffusion checkpoint.
