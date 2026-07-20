@@ -568,7 +568,7 @@ mod tests {
         let arguments = Arguments::try_parse_from(["web"]).unwrap();
         assert_eq!(
             arguments.gan_checkpoint,
-            PathBuf::from("../ckpt/mlx/gan/opencpop/model.safetensors")
+            PathBuf::from("../ckpt/mlx/gan/guan/model.safetensors")
         );
         assert_eq!(
             arguments.flow_matching_checkpoint,

@@ -48,69 +48,104 @@ fn decode_input(input: &mut format::context::Input, label: &str) -> Result<Audio
 
     let mut converter = None;
     let mut decoded_audio = DecodedAudio::default();
+    let mut decode_status = DecodeStatus::default();
+    let mut decoder_reached_eof = false;
     for packet in input.packets() {
         let (stream, packet) =
             packet.with_context(|| format!("failed to read an audio packet from {label}"))?;
         if stream.index() != stream_index {
             continue;
         }
-        decoder.send_packet(&packet).with_context(|| {
-            format!("failed to send an audio packet to the decoder for {label}")
-        })?;
-        receive_frames(
+        if packet.size() == 0 {
+            continue;
+        }
+        match decoder.send_packet(&packet) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => {
+                anyhow::bail!("audio decoder for {label} unexpectedly rejected an input packet")
+            }
+            Err(ffmpeg::Error::Eof) => {
+                decoder_reached_eof = true;
+                break;
+            }
+            Err(_) => decode_status.decode_errors += 1,
+        }
+        if receive_frames(
             &mut decoder,
             &mut converter,
             &mut decoded_audio,
+            &mut decode_status,
             label,
             false,
-        )?;
+        )? {
+            decoder_reached_eof = true;
+            break;
+        }
     }
 
-    decoder
-        .send_eof()
-        .with_context(|| format!("failed to flush the audio decoder for {label}"))?;
+    if !decoder_reached_eof {
+        match decoder.send_eof() {
+            Ok(()) | Err(ffmpeg::Error::Eof) => {}
+            Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => {
+                anyhow::bail!("audio decoder for {label} unexpectedly rejected EOF")
+            }
+            Err(_) => decode_status.decode_errors += 1,
+        }
+    }
     receive_frames(
         &mut decoder,
         &mut converter,
         &mut decoded_audio,
+        &mut decode_status,
         label,
         true,
     )?;
     if let Some(mut converter) = converter {
         converter.flush(&mut decoded_audio, label)?;
     }
+    let decode_attempts = decode_status.frames_decoded + decode_status.decode_errors;
+    let decode_error_rate = if decode_attempts == 0 {
+        0.0_f32
+    } else {
+        decode_status.decode_errors as f32 / decode_attempts as f32
+    };
+    ensure!(
+        decode_error_rate <= 2.0_f32 / 3.0_f32,
+        "decode error rate {decode_error_rate} for {label} exceeds FFmpeg's default maximum"
+    );
     decoded_audio.finish(label)
+}
+
+#[derive(Default)]
+struct DecodeStatus {
+    frames_decoded: usize,
+    decode_errors: usize,
 }
 
 fn receive_frames(
     decoder: &mut ffmpeg::decoder::Audio,
     converter: &mut Option<FrameConverter>,
     decoded_audio: &mut DecodedAudio,
+    decode_status: &mut DecodeStatus,
     label: &str,
     draining: bool,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         let mut decoded = frame::Audio::empty();
         match decoder.receive_frame(&mut decoded) {
-            Ok(()) => convert_frame(decoded, converter, decoded_audio, label)?,
+            Ok(()) => {
+                decode_status.frames_decoded += 1;
+                convert_frame(decoded, converter, decoded_audio, label)?;
+            }
             Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => {
                 ensure!(
                     !draining,
                     "audio decoder for {label} requested more input after EOF"
                 );
-                return Ok(());
+                return Ok(false);
             }
-            Err(ffmpeg::Error::Eof) => {
-                ensure!(
-                    draining,
-                    "audio decoder for {label} reached EOF prematurely"
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to receive a decoded frame from {label}"));
-            }
+            Err(ffmpeg::Error::Eof) => return Ok(true),
+            Err(_) => decode_status.decode_errors += 1,
         }
     }
 }
@@ -357,6 +392,24 @@ mod tests {
         Ok(cursor.into_inner())
     }
 
+    fn pcm24_wav_with_padding_in_data_size() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&40_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&144_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; 4]);
+        bytes
+    }
+
     #[test]
     fn file_and_memory_inputs_average_every_channel() -> Result<()> {
         let bytes_48k = stereo_wav(48_000)?;
@@ -384,6 +437,27 @@ mod tests {
             memory_audio_48k.samples.as_slice::<f32>(),
             file_audio.samples.as_slice::<f32>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_incomplete_pcm_sample_matches_ffmpeg_default() -> Result<()> {
+        let bytes = pcm24_wav_with_padding_in_data_size();
+        let memory_audio = from_bytes(&bytes, "wav", "audio/wav")?;
+
+        let directory = std::path::Path::new("target/audio-loading-tests");
+        fs::create_dir_all(directory)?;
+        let path = directory.join(format!("incomplete-pcm-{}.wav", std::process::id()));
+        fs::write(&path, &bytes)?;
+        let file_audio = from_file(&path)?;
+        fs::remove_file(path)?;
+
+        assert_eq!(memory_audio.sample_rate, 48_000);
+        assert_eq!(file_audio.sample_rate, 48_000);
+        assert_eq!(memory_audio.samples.shape(), &[1, 1]);
+        assert_eq!(file_audio.samples.shape(), &[1, 1]);
+        assert_eq!(memory_audio.samples.as_slice::<f32>(), &[0.0]);
+        assert_eq!(file_audio.samples.as_slice::<f32>(), &[0.0]);
         Ok(())
     }
 }
